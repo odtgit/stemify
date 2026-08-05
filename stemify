@@ -116,6 +116,14 @@ def embed_cover(dest, src):
     return True
 
 
+def stem_manifest():
+    return {
+        "mastering_dsp": MANIFEST_DSP,
+        "version": 1,
+        "stems": [{"color": c, "name": nm} for _, c, nm in STEMS],
+    }
+
+
 def iter_boxes(buf, start, end):
     """Yield (offset, size, type) for each MP4 box in [start, end)."""
     pos = start
@@ -181,6 +189,48 @@ def verify(path):
     return len(n), has_atom
 
 
+def art_only(args):
+    """Swap art in finished stems without touching the audio.
+
+    Fix the art in the source file first — it stays the source of truth, and
+    the next full render would otherwise put the old cover straight back.
+    embed_cover rewrites moov, so the stem atom is re-checked afterwards and
+    re-injected if the rewrite lost it (not observed with mutagen, but the
+    repair is one call and the alternative is a silent fall back to
+    extension-only stem detection in Mixxx).
+    """
+    failures = 0
+    for t in args.tracks:
+        dest = args.output_dir / (t.stem + ".stem.mp4")
+        if not t.is_file():
+            print(f"skip (not a file): {t}", file=sys.stderr)
+            failures += 1
+            continue
+        if not dest.is_file():
+            print(f"skip (no stem to update): {dest.name}", file=sys.stderr)
+            failures += 1
+            continue
+        if not embed_cover(dest, t):
+            print(f"    !! no embedded art in {t.name}", file=sys.stderr)
+            failures += 1
+            continue
+        streams, atom = verify(dest)
+        if not atom:
+            try:
+                inject_manifest(dest, stem_manifest())
+                streams, atom = verify(dest)
+            except RuntimeError as e:
+                print(f"    !! {dest.name}: manifest lost and not re-injectable "
+                      f"({e}) — re-render with --force", file=sys.stderr)
+        if streams != 5 or not atom:
+            failures += 1
+            continue
+        print(f"    -> {dest.name}  (art refreshed, {streams} streams, "
+              f"manifest ok)", flush=True)
+    print(f"\ndone: {len(args.tracks) - failures}/{len(args.tracks)} succeeded")
+    return 1 if failures else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -192,9 +242,15 @@ def main():
                     help="also keep the raw separated wavs")
     ap.add_argument("--force", action="store_true",
                     help="re-render even if the .stem.mp4 already exists")
+    ap.add_argument("--art-only", action="store_true",
+                    help="refresh the covr atom in the existing .stem.mp4 from "
+                         "the source's embedded art; no separation, no re-encode")
     args = ap.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.art_only:
+        return art_only(args)
 
     todo = []
     for t in args.tracks:
@@ -233,11 +289,7 @@ def main():
             stems = separate(sep, src, work)
             mux(src, stems, dest, probe_rate(src), args.bitrate)
             art = embed_cover(dest, src)
-            inject_manifest(dest, {
-                "mastering_dsp": MANIFEST_DSP,
-                "version": 1,
-                "stems": [{"color": c, "name": nm} for _, c, nm in STEMS],
-            })
+            inject_manifest(dest, stem_manifest())
             streams, atom = verify(dest)
             if streams != 5 or not atom:
                 raise RuntimeError(f"bad output: {streams} streams, atom={atom}")
