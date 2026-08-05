@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Turn ordinary tracks into Native Instruments .stem.mp4 files for Mixxx 2.6+.
+
+Pipeline per track:
+  1. htdemucs_ft (GPU) splits the track into drums/bass/other/vocals
+  2. ffmpeg muxes the original as stream 0 plus the four stems as streams 1-4
+  3. the NI stem manifest is injected as a moov.udta.stem atom
+
+Mixxx wants exactly 5 streams, identical codec and sample rate, and finds the
+stem labels/colours in that atom (falling back to the .stem.mp4 extension).
+"""
+
+import argparse
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# Order is load-bearing: Mixxx maps stream 1..4 onto these slots.
+STEMS = [
+    ("Drums", "#009E73", "Drums"),
+    ("Bass", "#D55E00", "Bass"),
+    ("Other", "#CC79A7", "Other"),
+    ("Vocals", "#56B4E9", "Vox"),
+]
+
+# Mirrors Native Instruments' own manifest; the DSP block is inert but expected.
+MANIFEST_DSP = {
+    "compressor": {
+        "enabled": False, "ratio": 3, "output_gain": 0.5,
+        "release": 0.300000011920929, "attack": 0.003000000026077032,
+        "input_gain": 0.5, "threshold": 0, "hp_cutoff": 300, "dry_wet": 50,
+    },
+    "limiter": {
+        "enabled": False, "release": 0.05000000074505806,
+        "threshold": 0, "ceiling": -0.3499999940395355,
+    },
+}
+
+
+def probe_rate(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=sample_rate", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, check=True).stdout.strip()
+    return int(out.splitlines()[0])
+
+
+def separate(separator, src, workdir):
+    """Run the model and return the four stem paths in NI order.
+
+    output_dir is fixed when the model loads, so we take the paths the library
+    reports back and sort them into NI order by the label in the filename.
+    """
+    produced = [workdir / Path(p).name for p in separator.separate(str(src))]
+
+    paths = []
+    for label, _, _ in STEMS:
+        hits = [p for p in produced if f"({label})" in p.name]
+        if not hits:
+            raise RuntimeError(
+                f"model produced no {label} stem (got: "
+                f"{', '.join(p.name for p in produced) or 'nothing'})")
+        paths.append(hits[0])
+    return paths
+
+
+def mux(src, stems, dest, rate, bitrate):
+    """Mux master + 4 stems into a 5-stream m4a. moov lands last, which the
+    atom injection below depends on."""
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src)]
+    for s in stems:
+        cmd += ["-i", str(s)]
+    for i in range(5):
+        cmd += ["-map", f"{i}:a:0"]
+    # No +use_metadata_tags: that stores tags as QuickTime mdta keys, which
+    # ffprobe reads but TagLib does not — Mixxx then shows an empty artist
+    # (single-dash filenames only *looked* tagged via Mixxx's filename guess).
+    # Default ilst mapping covers artist/title/album/date; ISRC is dropped,
+    # the source FLAC keeps it.
+    cmd += ["-c:a", "aac", "-b:a", bitrate, "-ar", str(rate), "-ac", "2",
+            "-map_metadata", "0",
+            "-f", "mp4", str(dest)]
+    subprocess.run(cmd, check=True)
+
+
+def embed_cover(dest, src):
+    """Copy the source's embedded art into the iTunes covr atom.
+
+    ffmpeg cannot do this in the mux: FLAC/MP3 art is an attached-pic *stream*
+    to it, and the output must stay exactly 5 audio streams for Mixxx. Runs
+    before inject_manifest so mutagen's moov rewrite cannot disturb the stem
+    atom (and moov stays last, which injection asserts).
+    """
+    from mutagen import File as MFile
+    from mutagen.mp4 import MP4, MP4Cover
+
+    m = MFile(str(src))
+    data = mime = None
+    if getattr(m, "pictures", None):                     # FLAC
+        data, mime = m.pictures[0].data, m.pictures[0].mime
+    elif m is not None and m.tags:                       # MP3 APIC
+        apic = [v for k, v in m.tags.items() if k.startswith("APIC")]
+        if apic:
+            data, mime = apic[0].data, apic[0].mime
+    if not data:
+        return False
+    fmt = MP4Cover.FORMAT_PNG if "png" in (mime or "") else MP4Cover.FORMAT_JPEG
+    mp4 = MP4(str(dest))
+    mp4["covr"] = [MP4Cover(data, imageformat=fmt)]
+    mp4.save()
+    return True
+
+
+def iter_boxes(buf, start, end):
+    """Yield (offset, size, type) for each MP4 box in [start, end)."""
+    pos = start
+    while pos + 8 <= end:
+        size, btype = struct.unpack(">I4s", buf[pos:pos + 8])
+        if size == 1:  # 64-bit extended size
+            size = struct.unpack(">Q", buf[pos + 8:pos + 16])[0]
+        elif size == 0:  # extends to EOF
+            size = end - pos
+        if size < 8:
+            raise ValueError(f"corrupt box at {pos}")
+        yield pos, size, btype.decode("latin-1")
+        pos += size
+
+
+def inject_manifest(path, manifest):
+    """Append moov.udta.stem. Safe only because ffmpeg wrote moov last, so
+    growing it cannot shift mdat and invalidate the stco chunk offsets."""
+    buf = bytearray(Path(path).read_bytes())
+
+    top = list(iter_boxes(buf, 0, len(buf)))
+    moov = next((b for b in top if b[2] == "moov"), None)
+    if moov is None:
+        raise RuntimeError("no moov box found")
+    if moov is not top[-1]:
+        raise RuntimeError("moov is not the last box; refusing to corrupt offsets")
+
+    moov_off, moov_size, _ = moov
+    payload = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    stem_box = struct.pack(">I4s", 8 + len(payload), b"stem") + payload
+
+    udta = next((b for b in iter_boxes(buf, moov_off + 8, moov_off + moov_size)
+                 if b[2] == "udta"), None)
+
+    if udta is None:
+        new = struct.pack(">I4s", 8 + len(stem_box), b"udta") + stem_box
+        buf[moov_off + moov_size:moov_off + moov_size] = new
+        grow = len(new)
+    else:
+        u_off, u_size, _ = udta
+        buf[u_off + u_size:u_off + u_size] = stem_box
+        grow = len(stem_box)
+        struct.pack_into(">I", buf, u_off, u_size + grow)
+
+    struct.pack_into(">I", buf, moov_off, moov_size + grow)
+    Path(path).write_bytes(bytes(buf))
+
+
+def verify(path):
+    """Confirm the result is actually loadable as a stem file."""
+    n = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, check=True).stdout.split()
+    buf = Path(path).read_bytes()
+    moov = next(b for b in iter_boxes(bytearray(buf), 0, len(buf)) if b[2] == "moov")
+    has_atom = any(
+        b[2] == "stem"
+        for u in iter_boxes(bytearray(buf), moov[0] + 8, moov[0] + moov[1])
+        if u[2] == "udta"
+        for b in iter_boxes(bytearray(buf), u[0] + 8, u[0] + u[1])
+    )
+    return len(n), has_atom
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("tracks", nargs="+", type=Path)
+    ap.add_argument("-o", "--output-dir", type=Path, default=Path.cwd())
+    ap.add_argument("-m", "--model", default="htdemucs_ft.yaml")
+    ap.add_argument("-b", "--bitrate", default="256k")
+    ap.add_argument("--keep-stems", action="store_true",
+                    help="also keep the raw separated wavs")
+    ap.add_argument("--force", action="store_true",
+                    help="re-render even if the .stem.mp4 already exists")
+    args = ap.parse_args()
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    todo = []
+    for t in args.tracks:
+        if not t.is_file():
+            print(f"skip (not a file): {t}", file=sys.stderr)
+            continue
+        dest = args.output_dir / (t.stem + ".stem.mp4")
+        if dest.exists() and not args.force:
+            print(f"skip (exists): {dest.name}")
+            continue
+        todo.append((t, dest))
+
+    if not todo:
+        print("nothing to do")
+        return 0
+
+    os.environ.setdefault("TQDM_DISABLE", "1")  # per-chunk bars swamp batch logs
+
+    # Import late so --help stays instant; loading torch takes seconds.
+    from audio_separator.separator import Separator
+
+    model_dir = os.environ.get("AUDIO_SEPARATOR_MODEL_DIR",
+                               str(Path(__file__).parent / "models"))
+    # One scratch dir for the whole batch: output_dir is baked in at load_model
+    # time, so it cannot be moved per track.
+    work = Path(tempfile.mkdtemp(prefix="stemify-", dir=args.output_dir))
+    sep = Separator(output_dir=str(work), output_format="WAV",
+                    model_file_dir=model_dir, log_level=40)
+    print(f"loading {args.model} ...", flush=True)
+    sep.load_model(args.model)  # once, then reused across the batch
+
+    failures = 0
+    for n, (src, dest) in enumerate(todo, 1):
+        print(f"[{n}/{len(todo)}] {src.name}", flush=True)
+        try:
+            stems = separate(sep, src, work)
+            mux(src, stems, dest, probe_rate(src), args.bitrate)
+            art = embed_cover(dest, src)
+            inject_manifest(dest, {
+                "mastering_dsp": MANIFEST_DSP,
+                "version": 1,
+                "stems": [{"color": c, "name": nm} for _, c, nm in STEMS],
+            })
+            streams, atom = verify(dest)
+            if streams != 5 or not atom:
+                raise RuntimeError(f"bad output: {streams} streams, atom={atom}")
+            if args.keep_stems:
+                keep = args.output_dir / f"{src.stem}.stems"
+                keep.mkdir(exist_ok=True)
+                for p, (label, _, _) in zip(stems, STEMS):
+                    shutil.move(str(p), keep / f"{label.lower()}{p.suffix}")
+            print(f"    -> {dest.name}  (5 streams, manifest ok, "
+                  f"art {'ok' if art else 'MISSING in source'})", flush=True)
+        except Exception as e:
+            failures += 1
+            print(f"    !! failed: {e}", file=sys.stderr, flush=True)
+            dest.unlink(missing_ok=True)
+        finally:
+            # Clear the scratch dir between tracks so the next separate() can't
+            # pick up a previous track's stems.
+            for leftover in work.iterdir():
+                leftover.unlink(missing_ok=True)
+
+    shutil.rmtree(work, ignore_errors=True)
+    print(f"\ndone: {len(todo) - failures}/{len(todo)} succeeded")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
