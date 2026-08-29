@@ -12,6 +12,7 @@ stem labels/colours in that atom (falling back to the .stem.mp4 extension).
 
 import argparse
 import json
+import math
 import os
 import shutil
 import struct
@@ -27,6 +28,24 @@ STEMS = [
     ("Other", "#CC79A7", "Other"),
     ("Vocals", "#56B4E9", "Vox"),
 ]
+
+# Reconstruction gate. htdemucs is not constrained to sum back to the mix, so a
+# few tracks per hundred come apart badly. Warn, never fail: the file still
+# plays, it just does not sound like the source.
+#
+# The raw null is a poor gate on its own -- it tracks how dense the material is,
+# not how wrong the result sounds. Measured: dense limited EDM nulls around
+# -12 dB while matching the source within 0.4 dB in every octave. So the null
+# only catches catastrophes, and the two thresholds that decide "audible" are
+# the broadband level and the HF tilt. Broadband alone is not enough either: the
+# player derives ReplayGain from the same sum it plays, so a uniform offset is
+# normalised back out and only the tilt survives.
+NULL_FAIL_DB = -8.0
+OFFSET_WARN_DB = 1.0
+TILT_WARN_DB = 1.5
+CHECK_CHUNK = 1 << 20
+CHECK_NFFT = 16384
+HF_BAND_HZ = (10000, 20000)
 
 # Mirrors Native Instruments' own manifest; the DSP block is inert but expected.
 MANIFEST_DSP = {
@@ -67,6 +86,73 @@ def separate(separator, src, workdir):
                 f"{', '.join(p.name for p in produced) or 'nothing'})")
         paths.append(hits[0])
     return paths
+
+
+def _mono_pipe(path):
+    return subprocess.Popen(
+        ["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-map", "0:a:0",
+         "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", "44100", "-"],
+        stdout=subprocess.PIPE)
+
+
+def reconstruction(src, stems):
+    """Null the summed stems against the source.
+
+    Returns (null_db, level_offset_db, hf_tilt_db), the last being the 10-20k
+    level relative to the broadband level -- what is left once the player's
+    ReplayGain has normalised the broadband part away.
+
+    Runs on the float stems before the mux, so the AAC floor (~-31 dB) is not
+    folded into the result. Streamed in chunks; five full decodes at once do
+    not fit comfortably in memory.
+    """
+    import numpy as np
+
+    win = np.hanning(CHECK_NFFT)
+    freqs = np.fft.rfftfreq(CHECK_NFFT, 1 / 44100)
+    hf = (freqs >= HF_BAND_HZ[0]) & (freqs < HF_BAND_HZ[1])
+
+    procs = [_mono_pipe(p) for p in (src, *stems)]
+    ss_mix = ss_sum = ss_diff = 0.0
+    hf_mix = hf_sum = 0.0
+    try:
+        while True:
+            bufs = [p.stdout.read(CHECK_CHUNK * 4) for p in procs]
+            n = min(len(b) for b in bufs)
+            n -= n % 4
+            if n == 0:
+                break
+            a = [np.frombuffer(b[:n], dtype=np.float32).astype(np.float64)
+                 for b in bufs]
+            mix = a[0]
+            tot = a[1] + a[2] + a[3] + a[4]
+            dif = mix - tot
+            ss_mix += float(np.dot(mix, mix))
+            ss_sum += float(np.dot(tot, tot))
+            ss_diff += float(np.dot(dif, dif))
+
+            k = mix.size // CHECK_NFFT
+            if k:
+                for sig, acc in ((mix, "mix"), (tot, "sum")):
+                    fr = sig[:k * CHECK_NFFT].reshape(k, CHECK_NFFT) * win
+                    power = float((np.abs(np.fft.rfft(fr, axis=1))[:, hf] ** 2).sum())
+                    if acc == "mix":
+                        hf_mix += power
+                    else:
+                        hf_sum += power
+    finally:
+        for p in procs:
+            p.stdout.close()
+            p.wait()
+
+    if ss_mix <= 0:
+        return float("nan"), float("nan"), float("nan")
+    null_db = 10 * math.log10(max(ss_diff, 1e-30) / ss_mix)
+    offset_db = 10 * math.log10(max(ss_sum, 1e-30) / ss_mix)
+    if hf_mix <= 0:
+        return null_db, offset_db, float("nan")
+    tilt_db = 10 * math.log10(max(hf_sum, 1e-30) / hf_mix) - offset_db
+    return null_db, offset_db, tilt_db
 
 
 def mux(src, stems, dest, rate, bitrate):
@@ -283,10 +369,12 @@ def main():
     sep.load_model(args.model)  # once, then reused across the batch
 
     failures = 0
+    weak = 0
     for n, (src, dest) in enumerate(todo, 1):
         print(f"[{n}/{len(todo)}] {src.name}", flush=True)
         try:
             stems = separate(sep, src, work)
+            null_db, offset_db, tilt_db = reconstruction(src, stems)
             mux(src, stems, dest, probe_rate(src), args.bitrate)
             art = embed_cover(dest, src)
             inject_manifest(dest, stem_manifest())
@@ -299,7 +387,20 @@ def main():
                 for p, (label, _, _) in zip(stems, STEMS):
                     shutil.move(str(p), keep / f"{label.lower()}{p.suffix}")
             print(f"    -> {dest.name}  (5 streams, manifest ok, "
-                  f"art {'ok' if art else 'MISSING in source'})", flush=True)
+                  f"art {'ok' if art else 'MISSING in source'}, "
+                  f"null {null_db:+.1f} dB, tilt {tilt_db:+.2f} dB)", flush=True)
+            bad = []
+            if not null_db <= NULL_FAIL_DB:
+                bad.append(f"null {null_db:+.1f} dB (want <= {NULL_FAIL_DB:.0f})")
+            if not abs(offset_db) <= OFFSET_WARN_DB:
+                bad.append(f"level {offset_db:+.2f} dB (want <= {OFFSET_WARN_DB:.0f})")
+            if not abs(tilt_db) <= TILT_WARN_DB:
+                bad.append(f"HF tilt {tilt_db:+.2f} dB (want <= {TILT_WARN_DB:.1f})")
+            if bad:
+                weak += 1
+                print(f"    !! weak reconstruction: {', '.join(bad)} -- consider "
+                      f"a re-render or a different model",
+                      file=sys.stderr, flush=True)
         except Exception as e:
             failures += 1
             print(f"    !! failed: {e}", file=sys.stderr, flush=True)
@@ -311,7 +412,8 @@ def main():
                 leftover.unlink(missing_ok=True)
 
     shutil.rmtree(work, ignore_errors=True)
-    print(f"\ndone: {len(todo) - failures}/{len(todo)} succeeded")
+    print(f"\ndone: {len(todo) - failures}/{len(todo)} succeeded"
+          + (f", {weak} with weak reconstruction" if weak else ""))
     return 1 if failures else 0
 
 
