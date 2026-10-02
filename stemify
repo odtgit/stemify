@@ -18,8 +18,14 @@ Mixxx wants exactly 5 streams, identical codec and sample rate, and finds the
 stem labels/colours in that atom (falling back to the .stem.mp4 extension).
 """
 
+import time
+
+T0 = time.time()
+P0 = time.perf_counter()
+
 import argparse
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -28,7 +34,6 @@ import struct
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 import numpy as np
@@ -64,6 +69,54 @@ MANIFEST_DSP = {
 }
 
 
+class Prof:
+    """--profile: per-stage wall/CPU/epoch windows. Syncs CUDA at boundaries."""
+
+    def __init__(self):
+        import resource
+        import torch
+        self.rs, self.torch = resource, torch
+        self.stages = {}
+        self.stems = {}
+
+    def sync(self):
+        if self.torch.cuda.is_available():
+            self.torch.cuda.synchronize()
+
+    def mark(self):
+        self.sync()
+        return (time.perf_counter(), time.process_time(),
+                self.rs.getrusage(self.rs.RUSAGE_CHILDREN), time.time())
+
+    @contextlib.contextmanager
+    def stage(self, name, into=None):
+        a = self.mark()
+        try:
+            yield
+        finally:
+            b = self.mark()
+            ra, rb = a[2], b[2]
+            child = (rb.ru_utime + rb.ru_stime) - (ra.ru_utime + ra.ru_stime)
+            (self.stages if into is None else into)[name] = {
+                "wall": round(b[0] - a[0], 4),
+                "cpu": round(b[1] - a[1] + child, 4),
+                "t0": round(a[3], 3), "t1": round(b[3], 3)}
+
+    def hash_stems(self, arrs):
+        for (label, _, _), a in zip(STEMS, arrs):
+            a = np.ascontiguousarray(a, np.float32)
+            rms = math.sqrt(float(np.mean(a.astype(np.float64) ** 2)))
+            self.stems[label.lower()] = {
+                "sha256": hashlib.sha256(a.tobytes()).hexdigest(),
+                "rms_db": round(20 * math.log10(max(rms, 1e-12)), 3)}
+
+    def out(self):
+        return {**self.stages, "stems": self.stems}
+
+    def line(self):
+        return " ".join(f"{k} {v['wall']:.1f}" for k, v in self.stages.items())
+
+
 def probe_rate(path):
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "a:0",
@@ -94,20 +147,28 @@ def sep(model, x):
     return {k: np.ascontiguousarray(v.T[:n]) for k, v in out.items()}
 
 
-def separate_ft2sw(models, src):
+def separate_ft2sw(models, src, prof=None):
     """Return (stems in NI order, mix length, other-extra dB)."""
     m_v, m_sw = models
-    mix = decode(src)
-    v = sep(m_v, mix)["vocals"]
-    inst = mix - v
-    st = sep(m_sw, inst)
-    d, b = st["drums"], st["bass"]
-    o = inst - d - b
-    # Energy in O that SW itself did not call other/guitar/piano.
-    eo = energy(o)
-    extra = energy(o - (st["other"] + st["guitar"] + st["piano"]))
-    extra_db = (10 * math.log10(max(extra, 1e-30) / eo)
-                if eo > 0 else float("nan"))
+    S = prof.stage if prof else (lambda n: contextlib.nullcontext())
+    with S("decode"):
+        mix = decode(src)
+    with S("vocal_pass"):
+        v = sep(m_v, mix)["vocals"]
+    with S("inst"):
+        inst = mix - v
+    with S("sw_pass"):
+        st = sep(m_sw, inst)
+    with S("residual"):
+        d, b = st["drums"], st["bass"]
+        o = inst - d - b
+        # Energy in O that SW itself did not call other/guitar/piano.
+        eo = energy(o)
+        extra = energy(o - (st["other"] + st["guitar"] + st["piano"]))
+        extra_db = (10 * math.log10(max(extra, 1e-30) / eo)
+                    if eo > 0 else float("nan"))
+    if prof:
+        prof.hash_stems([d, b, o, v])
     return [d, b, o, v], len(mix), extra_db
 
 
@@ -292,6 +353,10 @@ def main():
     ap.add_argument("--art-only", action="store_true",
                     help="refresh the covr atom in the existing .stem.mp4 from "
                          "the source's embedded art; no separation, no re-encode")
+    ap.add_argument("--profile", action="store_true",
+                    help="per-stage wall/CPU timing, stem hashes and RMS (see README)")
+    ap.add_argument("--fp32", action="store_true",
+                    help="disable autocast (fp16) in both models, for comparison")
     ap.add_argument("--json", action="store_true",
                     help="one JSON event per stdout line instead of human lines")
     args = ap.parse_args()
@@ -333,6 +398,13 @@ def main():
 
     # Import late so --help stays instant; loading torch takes seconds.
     from msst import Separator
+    prof = None
+    if args.profile:
+        prof = Prof()
+        prof.sync()
+        startup = {"wall": round(time.perf_counter() - P0, 4),
+                   "cpu": round(time.process_time(), 4),
+                   "t0": round(T0, 3), "t1": round(time.time(), 3)}
 
     model_dir = Path(os.environ.get("STEMIFY_MODEL_DIR",
                                     os.environ.get("AUDIO_SEPARATOR_MODEL_DIR",
@@ -346,8 +418,23 @@ def main():
             return Separator(config_path=model_dir / cfg, checkpoint_path=model_dir / ckpt,
                              model_type=mtype, detailed_progress=False)
 
-    models = (load(VOCAL_MODEL), load(SW_MODEL))
+    ml = {}
+    with (prof.stage("model_load", ml) if prof else contextlib.nullcontext()):
+        models = (load(VOCAL_MODEL), load(SW_MODEL))
     models[0]._config.inference.num_overlap = args.vocal_overlap  # SW keeps its YAML value
+    if args.fp32:
+        for m in models:
+            m._config.training.use_amp = False
+            # fp32 has no flash kernel; the models' flash-only config would abort
+            for mod in m._model.modules():
+                cfg = getattr(mod, "cuda_config", None)
+                if cfg is not None:
+                    mod.cuda_config = type(cfg)(False, True, True)
+    if prof:
+        event(event="profile_process", startup=startup, model_load=ml["model_load"],
+              fp32=args.fp32)
+        say(f"profile: startup {startup['wall']:.1f}s, model_load "
+            f"{ml['model_load']['wall']:.1f}s")
 
     event(event="start", n=len(todo))
     failures = 0
@@ -355,19 +442,25 @@ def main():
         say(f"[{n}/{len(todo)}] {src.name}")
         event(event="track_start", i=n, src=str(src))
         t0 = time.monotonic()
+        if prof:
+            prof.stages, prof.stems = {}, {}
+        S = prof.stage if prof else (lambda n: contextlib.nullcontext())
         try:
-            arrs, nframes, extra_db = separate_ft2sw(models, src)
+            arrs, nframes, extra_db = separate_ft2sw(models, src, prof)
             stems = []
-            for (label, _, _), a in zip(STEMS, arrs):
-                p = work / f"{label.lower()}.wav"
-                sf.write(str(p), a, RATE, subtype="FLOAT")
-                stems.append(p)
-            mux(src, stems, dest, probe_rate(src), args.bitrate)
-            art = embed_cover(dest, src)
-            inject_manifest(dest, stem_manifest())
-            streams, atom = verify(dest)
-            if streams != 5 or not atom:
-                raise RuntimeError(f"bad output: {streams} streams, atom={atom}")
+            with S("write_wavs"):
+                for (label, _, _), a in zip(STEMS, arrs):
+                    p = work / f"{label.lower()}.wav"
+                    sf.write(str(p), a, RATE, subtype="FLOAT")
+                    stems.append(p)
+            with S("mux"):
+                mux(src, stems, dest, probe_rate(src), args.bitrate)
+            with S("finalize"):
+                art = embed_cover(dest, src)
+                inject_manifest(dest, stem_manifest())
+                streams, atom = verify(dest)
+                if streams != 5 or not atom:
+                    raise RuntimeError(f"bad output: {streams} streams, atom={atom}")
             if args.keep_stems:
                 keep = args.output_dir / f"{src.stem}.stems"
                 keep.mkdir(exist_ok=True)
@@ -379,10 +472,12 @@ def main():
             say(f"    -> {dest.name}  (5 streams, manifest ok, "
                 f"art {'ok' if art else 'MISSING in source'}, other-extra "
                 f"{extra_db:+.1f} dB, {secs:.0f}s for {audio_secs:.0f}s audio)")
+            if prof:
+                say(f"    profile: {prof.line()}")
             event(event="track_done", i=n, src=str(src), dest=str(dest),
                   secs=round(secs, 2), audio_secs=round(audio_secs, 2),
                   other_extra_db=None if math.isnan(extra_db) else round(extra_db, 2),
-                  warnings=warnings)
+                  warnings=warnings, **({"profile": prof.out()} if prof else {}))
         except Exception as e:
             failures += 1
             if not args.json:

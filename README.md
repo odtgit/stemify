@@ -189,6 +189,8 @@ carried over, and embedded cover art from FLAC and MP3 sources.
 | `--force` | off | re-render existing outputs |
 | `--art-only` | off | copy embedded art from the source into existing outputs |
 | `--json` | off | machine-readable progress (below) |
+| `--profile` | off | per-stage timing, stem hashes (adds `profile` to `--json`; see Profiling) |
+| `--fp32` | off | disable autocast, for precision comparison only |
 
 ### In Mixxx
 
@@ -245,6 +247,18 @@ systemd-run --user --collect -p CPUWeight=20 -p Nice=19 -p IOSchedulingClass=idl
 
 GPU contention with waveform rendering has no equivalent knob on consumer
 NVIDIA cards; avoid rendering during a live set.
+
+### Profiling
+
+```bash
+./profile_run.sh [--fence] [--fp32] [-o OUTDIR] track.flac ...
+```
+
+Renders into a scratch dir with `--json --profile --force` while sampling the
+GPU every 100 ms, then prints per-stage wall time, GPU utilisation, CPU cores
+and a wall-vs-minutes fit (`profile_summary.py`). `--fence` runs under the same
+systemd limits as the background batch example above. Pass several run dirs to `profile_summary.py` to
+compare stem hashes between runs. Baseline: [docs/profile-baseline.md](docs/profile-baseline.md).
 
 ## Output format
 
