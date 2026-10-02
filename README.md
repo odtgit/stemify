@@ -135,7 +135,7 @@ RTX 3060 12 GB, fp16 autocast, both models resident:
 ## Install
 
 ```bash
-git clone <this repo> stemify && cd stemify
+git clone https://github.com/odtgit/stemify && cd stemify
 uv venv -p 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 ```
