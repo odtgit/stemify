@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 """Turn ordinary tracks into Native Instruments .stem.mp4 files for Mixxx 2.6+.
 
-Pipeline per track:
-  1. htdemucs_ft (GPU) splits the track into drums/bass/other/vocals
-  2. ffmpeg muxes the original as stream 0 plus the four stems as streams 1-4
-  3. the NI stem manifest is injected as a moov.udta.stem atom
+Pipeline per track (default model "ft2sw"):
+  1. ffmpeg decodes the source to a float32 44.1k stereo wav (the mix)
+  2. mel_band_roformer_kim_ft2_bleedless_unwa (GPU, MSST) extracts vocals V
+  3. inst = mix - V; BS-Roformer-SW (6-stem, MSST) splits inst, keeping drums D, bass B
+  4. other = inst - D - B, so D+B+other+V == mix exactly (all float wav)
+  5. ffmpeg muxes the original as stream 0 plus the four stems as streams 1-4
+  6. the NI stem manifest is injected as a moov.udta.stem atom
+
+--json: one JSON object per stdout line (start, track_start, track_done,
+track_failed, done) instead of the human lines; see README.
+Why ft2sw: htdemucs_ft vocal SDR 8.33 vs ~11.1-11.3 for RoFormers (MVSep
+multisong). ~95 s per 4-min track on the RTX 3060.
 
 Mixxx wants exactly 5 streams, identical codec and sample rate, and finds the
 stem labels/colours in that atom (falling back to the .stem.mp4 extension).
 """
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -19,7 +28,11 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
+
+import numpy as np
+import soundfile as sf
 
 # Order is load-bearing: Mixxx maps stream 1..4 onto these slots.
 STEMS = [
@@ -29,23 +42,13 @@ STEMS = [
     ("Vocals", "#56B4E9", "Vox"),
 ]
 
-# Reconstruction gate. htdemucs is not constrained to sum back to the mix, so a
-# few tracks per hundred come apart badly. Warn, never fail: the file still
-# plays, it just does not sound like the source.
-#
-# The raw null is a poor gate on its own -- it tracks how dense the material is,
-# not how wrong the result sounds. Measured: dense limited EDM nulls around
-# -12 dB while matching the source within 0.4 dB in every octave. So the null
-# only catches catastrophes, and the two thresholds that decide "audible" are
-# the broadband level and the HF tilt. Broadband alone is not enough either: the
-# player derives ReplayGain from the same sum it plays, so a uniform offset is
-# normalised back out and only the tilt survives.
-NULL_FAIL_DB = -8.0
-OFFSET_WARN_DB = 1.0
-TILT_WARN_DB = 1.5
-CHECK_CHUNK = 1 << 20
-CHECK_NFFT = 16384
-HF_BAND_HZ = (10000, 20000)
+DEFAULT_MODEL = "ft2sw"
+# (msst model_type, yaml, checkpoint), all under models/
+VOCAL_MODEL = ("mel_band_roformer", "config_mel_band_roformer_kim_ft_unwa.yaml",
+               "mel_band_roformer_kim_ft2_bleedless_unwa.ckpt")
+SW_MODEL = ("bs_roformer", "BS-Roformer-SW.yaml", "BS-Roformer-SW.ckpt")
+RATE = 44100
+VOCAL_OVERLAP = 2
 
 # Mirrors Native Instruments' own manifest; the DSP block is inert but expected.
 MANIFEST_DSP = {
@@ -69,90 +72,43 @@ def probe_rate(path):
     return int(out.splitlines()[0])
 
 
-def separate(separator, src, workdir):
-    """Run the model and return the four stem paths in NI order.
-
-    output_dir is fixed when the model loads, so we take the paths the library
-    reports back and sort them into NI order by the label in the filename.
-    """
-    produced = [workdir / Path(p).name for p in separator.separate(str(src))]
-
-    paths = []
-    for label, _, _ in STEMS:
-        hits = [p for p in produced if f"({label})" in p.name]
-        if not hits:
-            raise RuntimeError(
-                f"model produced no {label} stem (got: "
-                f"{', '.join(p.name for p in produced) or 'nothing'})")
-        paths.append(hits[0])
-    return paths
+def decode(src):
+    """Float32 stereo 44.1k (n, 2) straight from ffmpeg, no temp file."""
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(src), "-vn", "-map", "0:a:0",
+         "-ar", str(RATE), "-ac", "2", "-f", "f32le", "-"],
+        check=True, stdout=subprocess.PIPE).stdout
+    return np.frombuffer(raw, np.float32).reshape(-1, 2)
 
 
-def _mono_pipe(path):
-    return subprocess.Popen(
-        ["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-map", "0:a:0",
-         "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", "44100", "-"],
-        stdout=subprocess.PIPE)
+def energy(x):
+    return float(np.dot(x.ravel().astype(np.float64), x.ravel().astype(np.float64)))
 
 
-def reconstruction(src, stems):
-    """Null the summed stems against the source.
+def sep(model, x):
+    """x: (n, 2) float -> {stem: (n, 2) float32}. MSST chunks with the YAML
+    chunk_size/num_overlap and runs in float, no peak normalisation."""
+    with contextlib.redirect_stdout(sys.stderr):
+        out = model.separate(np.ascontiguousarray(x.T))
+    n = len(x)
+    return {k: np.ascontiguousarray(v.T[:n]) for k, v in out.items()}
 
-    Returns (null_db, level_offset_db, hf_tilt_db), the last being the 10-20k
-    level relative to the broadband level -- what is left once the player's
-    ReplayGain has normalised the broadband part away.
 
-    Runs on the float stems before the mux, so the AAC floor (~-31 dB) is not
-    folded into the result. Streamed in chunks; five full decodes at once do
-    not fit comfortably in memory.
-    """
-    import numpy as np
-
-    win = np.hanning(CHECK_NFFT)
-    freqs = np.fft.rfftfreq(CHECK_NFFT, 1 / 44100)
-    hf = (freqs >= HF_BAND_HZ[0]) & (freqs < HF_BAND_HZ[1])
-
-    procs = [_mono_pipe(p) for p in (src, *stems)]
-    ss_mix = ss_sum = ss_diff = 0.0
-    hf_mix = hf_sum = 0.0
-    try:
-        while True:
-            bufs = [p.stdout.read(CHECK_CHUNK * 4) for p in procs]
-            n = min(len(b) for b in bufs)
-            n -= n % 4
-            if n == 0:
-                break
-            a = [np.frombuffer(b[:n], dtype=np.float32).astype(np.float64)
-                 for b in bufs]
-            mix = a[0]
-            tot = a[1] + a[2] + a[3] + a[4]
-            dif = mix - tot
-            ss_mix += float(np.dot(mix, mix))
-            ss_sum += float(np.dot(tot, tot))
-            ss_diff += float(np.dot(dif, dif))
-
-            k = mix.size // CHECK_NFFT
-            if k:
-                for sig, acc in ((mix, "mix"), (tot, "sum")):
-                    fr = sig[:k * CHECK_NFFT].reshape(k, CHECK_NFFT) * win
-                    power = float((np.abs(np.fft.rfft(fr, axis=1))[:, hf] ** 2).sum())
-                    if acc == "mix":
-                        hf_mix += power
-                    else:
-                        hf_sum += power
-    finally:
-        for p in procs:
-            p.stdout.close()
-            p.wait()
-
-    if ss_mix <= 0:
-        return float("nan"), float("nan"), float("nan")
-    null_db = 10 * math.log10(max(ss_diff, 1e-30) / ss_mix)
-    offset_db = 10 * math.log10(max(ss_sum, 1e-30) / ss_mix)
-    if hf_mix <= 0:
-        return null_db, offset_db, float("nan")
-    tilt_db = 10 * math.log10(max(hf_sum, 1e-30) / hf_mix) - offset_db
-    return null_db, offset_db, tilt_db
+def separate_ft2sw(models, src):
+    """Return (stems in NI order, mix length, other-extra dB)."""
+    m_v, m_sw = models
+    mix = decode(src)
+    v = sep(m_v, mix)["vocals"]
+    inst = mix - v
+    st = sep(m_sw, inst)
+    d, b = st["drums"], st["bass"]
+    o = inst - d - b
+    # Energy in O that SW itself did not call other/guitar/piano.
+    eo = energy(o)
+    extra = energy(o - (st["other"] + st["guitar"] + st["piano"]))
+    extra_db = (10 * math.log10(max(extra, 1e-30) / eo)
+                if eo > 0 else float("nan"))
+    return [d, b, o, v], len(mix), extra_db
 
 
 def mux(src, stems, dest, rate, bitrate):
@@ -322,8 +278,13 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("tracks", nargs="+", type=Path)
     ap.add_argument("-o", "--output-dir", type=Path, default=Path.cwd())
-    ap.add_argument("-m", "--model", default="htdemucs_ft.yaml")
+    ap.add_argument("-m", "--model", default=DEFAULT_MODEL,
+                    help="only ft2sw is supported under MSST")
     ap.add_argument("-b", "--bitrate", default="256k")
+    ap.add_argument("--vocal-overlap", type=int, default=VOCAL_OVERLAP,
+                    help="chunk overlap count for the vocal model. 2 = 50%%: 32.6 dB "
+                         "from the YAML default 8 at 1/4.4 the time, no 8 s seams "
+                         "(measured 2026-10-02)")
     ap.add_argument("--keep-stems", action="store_true",
                     help="also keep the raw separated wavs")
     ap.add_argument("--force", action="store_true",
@@ -331,12 +292,25 @@ def main():
     ap.add_argument("--art-only", action="store_true",
                     help="refresh the covr atom in the existing .stem.mp4 from "
                          "the source's embedded art; no separation, no re-encode")
+    ap.add_argument("--json", action="store_true",
+                    help="one JSON event per stdout line instead of human lines")
     args = ap.parse_args()
+
+    if args.model != DEFAULT_MODEL:
+        ap.error(f"only -m {DEFAULT_MODEL} is supported (legacy htdemucs_ft path dropped)")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.art_only:
         return art_only(args)
+
+    def say(msg="", **kw):
+        if not args.json:
+            print(msg, flush=True, **kw)
+
+    def event(**kw):
+        if args.json:
+            print(json.dumps(kw), flush=True)
 
     todo = []
     for t in args.tracks:
@@ -345,36 +319,49 @@ def main():
             continue
         dest = args.output_dir / (t.stem + ".stem.mp4")
         if dest.exists() and not args.force:
-            print(f"skip (exists): {dest.name}")
+            say(f"skip (exists): {dest.name}")
             continue
         todo.append((t, dest))
 
     if not todo:
-        print("nothing to do")
+        say("nothing to do")
+        event(event="start", n=0)
+        event(event="done", ok=0, failed=0)
         return 0
 
-    os.environ.setdefault("TQDM_DISABLE", "1")  # per-chunk bars swamp batch logs
+    os.environ.setdefault("TQDM_DISABLE", "1")
 
     # Import late so --help stays instant; loading torch takes seconds.
-    from audio_separator.separator import Separator
+    from msst import Separator
 
-    model_dir = os.environ.get("AUDIO_SEPARATOR_MODEL_DIR",
-                               str(Path(__file__).parent / "models"))
-    # One scratch dir for the whole batch: output_dir is baked in at load_model
-    # time, so it cannot be moved per track.
+    model_dir = Path(os.environ.get("STEMIFY_MODEL_DIR",
+                                    os.environ.get("AUDIO_SEPARATOR_MODEL_DIR",
+                                                   Path(__file__).parent / "models")))
     work = Path(tempfile.mkdtemp(prefix="stemify-", dir=args.output_dir))
-    sep = Separator(output_dir=str(work), output_format="WAV",
-                    model_file_dir=model_dir, log_level=40)
-    print(f"loading {args.model} ...", flush=True)
-    sep.load_model(args.model)  # once, then reused across the batch
 
+    def load(spec):
+        mtype, cfg, ckpt = spec
+        say(f"loading {ckpt} ...")
+        with contextlib.redirect_stdout(sys.stderr):
+            return Separator(config_path=model_dir / cfg, checkpoint_path=model_dir / ckpt,
+                             model_type=mtype, detailed_progress=False)
+
+    models = (load(VOCAL_MODEL), load(SW_MODEL))
+    models[0]._config.inference.num_overlap = args.vocal_overlap  # SW keeps its YAML value
+
+    event(event="start", n=len(todo))
     failures = 0
-    weak = 0
     for n, (src, dest) in enumerate(todo, 1):
-        print(f"[{n}/{len(todo)}] {src.name}", flush=True)
+        say(f"[{n}/{len(todo)}] {src.name}")
+        event(event="track_start", i=n, src=str(src))
+        t0 = time.monotonic()
         try:
-            stems = separate(sep, src, work)
-            null_db, offset_db, tilt_db = reconstruction(src, stems)
+            arrs, nframes, extra_db = separate_ft2sw(models, src)
+            stems = []
+            for (label, _, _), a in zip(STEMS, arrs):
+                p = work / f"{label.lower()}.wav"
+                sf.write(str(p), a, RATE, subtype="FLOAT")
+                stems.append(p)
             mux(src, stems, dest, probe_rate(src), args.bitrate)
             art = embed_cover(dest, src)
             inject_manifest(dest, stem_manifest())
@@ -386,34 +373,30 @@ def main():
                 keep.mkdir(exist_ok=True)
                 for p, (label, _, _) in zip(stems, STEMS):
                     shutil.move(str(p), keep / f"{label.lower()}{p.suffix}")
-            print(f"    -> {dest.name}  (5 streams, manifest ok, "
-                  f"art {'ok' if art else 'MISSING in source'}, "
-                  f"null {null_db:+.1f} dB, tilt {tilt_db:+.2f} dB)", flush=True)
-            bad = []
-            if not null_db <= NULL_FAIL_DB:
-                bad.append(f"null {null_db:+.1f} dB (want <= {NULL_FAIL_DB:.0f})")
-            if not abs(offset_db) <= OFFSET_WARN_DB:
-                bad.append(f"level {offset_db:+.2f} dB (want <= {OFFSET_WARN_DB:.0f})")
-            if not abs(tilt_db) <= TILT_WARN_DB:
-                bad.append(f"HF tilt {tilt_db:+.2f} dB (want <= {TILT_WARN_DB:.1f})")
-            if bad:
-                weak += 1
-                print(f"    !! weak reconstruction: {', '.join(bad)} -- consider "
-                      f"a re-render or a different model",
-                      file=sys.stderr, flush=True)
+            secs = time.monotonic() - t0
+            audio_secs = nframes / RATE
+            warnings = [] if art else [f"no embedded art in {src.name}"]
+            say(f"    -> {dest.name}  (5 streams, manifest ok, "
+                f"art {'ok' if art else 'MISSING in source'}, other-extra "
+                f"{extra_db:+.1f} dB, {secs:.0f}s for {audio_secs:.0f}s audio)")
+            event(event="track_done", i=n, src=str(src), dest=str(dest),
+                  secs=round(secs, 2), audio_secs=round(audio_secs, 2),
+                  other_extra_db=None if math.isnan(extra_db) else round(extra_db, 2),
+                  warnings=warnings)
         except Exception as e:
             failures += 1
-            print(f"    !! failed: {e}", file=sys.stderr, flush=True)
+            if not args.json:
+                print(f"    !! failed: {e}", file=sys.stderr, flush=True)
+            event(event="track_failed", i=n, src=str(src), error=str(e))
             dest.unlink(missing_ok=True)
         finally:
-            # Clear the scratch dir between tracks so the next separate() can't
-            # pick up a previous track's stems.
-            for leftover in work.iterdir():
-                leftover.unlink(missing_ok=True)
+            for p in work.iterdir():
+                if p.is_file():
+                    p.unlink(missing_ok=True)
 
     shutil.rmtree(work, ignore_errors=True)
-    print(f"\ndone: {len(todo) - failures}/{len(todo)} succeeded"
-          + (f", {weak} with weak reconstruction" if weak else ""))
+    say(f"\ndone: {len(todo) - failures}/{len(todo)} succeeded")
+    event(event="done", ok=len(todo) - failures, failed=failures)
     return 1 if failures else 0
 
 

@@ -1,0 +1,10 @@
+# Direct deps, pinned to the tested setup (2026-10-02). Python 3.12.
+# uv venv -p 3.12 .venv && uv pip install --python .venv/bin/python -r requirements.txt
+# Full resolved set: requirements-lock.txt
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128          # msst 0.1.0 pins torch<2.12; bump both together
+torchaudio==2.11.0+cu128
+msst[bs-roformer,mel-band-roformer]==0.1.0
+numpy==2.5.3
+soundfile==0.14.0
+mutagen==1.48.1
