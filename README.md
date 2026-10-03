@@ -193,6 +193,7 @@ carried over, and embedded cover art from FLAC and MP3 sources.
 | `--profile` | off | per-stage timing, stem hashes (adds `profile` to `--json`; see Profiling) |
 | `--fp32` | off | disable autocast, for precision comparison only |
 | `--compile` | off | `torch.compile` both models: ~1.75x faster passes after a one-off warm-up (225 s cold, ~70 s with a warm inductor cache); stems differ from eager by -53 to -75 dB. Pays off from ~10 tracks per invocation (~3 with a warm cache). The inductor/triton caches persist in `${XDG_CACHE_HOME:-~/.cache}/stemify/{inductor,triton}` (~320 MB), so only the first run after a model or torch change is cold; `TORCHINDUCTOR_CACHE_DIR`/`TRITON_CACHE_DIR` override |
+| `--aot` | off | AOTInductor package of each model's transformer core (STFT/iSTFT stay eager), built once into `${XDG_CACHE_HOME:-~/.cache}/stemify/aot` (~1.6 GB; keyed by torch, GPU, checkpoint, chunk shape). Build 178 s and needs `CUDA_HOME` (CUDA toolkit headers + `lib64/libcudart.so`); reuse starts in ~11 s. Passes ~5% faster than `--compile`, worst stem difference vs eager -53.6 dB, VRAM +1.1 GB. Excludes `--compile`/`--fp32` |
 | `--compile-mode` | `default` | `reduce-overhead` or `max-autotune`; max-autotune warms up for 425 s to gain 6% |
 
 ### In Mixxx

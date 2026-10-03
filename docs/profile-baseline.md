@@ -116,4 +116,20 @@ Other-extra unchanged to 0.05 dB (-22.24, -23.21, -21.18, -27.63). Hashes differ
 
 Mega-cache (`torch.compiler.save_cache_artifacts`/`load_cache_artifacts`): saved after a warm run (166 MB, 4 FX graphs plus autotune configs), loaded into an empty cache dir at startup in 0.3 s: warm-up 216.1 s, i.e. no gain over a cold start (the 72 s warm figure needs the on-disk cache entries; the artifact does not reproduce them). Not added.
 
+## AOTInductor (`--aot`, 2026-10-03)
+Each model's forward is split: STFT, band indexing, complex mask apply and iSTFT stay eager; band split + transformers + mask heads (`Core`) are `torch.export`ed (strict=False, batch 1, 2 ch, YAML chunk_size; both inference batch sizes are 1) under autocast and packaged with `aoti_compile_and_package`, then loaded with `aoti_load_package` in place of `band_split` (layers emptied, heads replaced by index modules, so MSST's `demix` is untouched).
+Obstacles hit and fixes: (1) whole-model export fails in AOT codegen (`aten.full`/`select` fallbacks from the complex/STFT section), hence the split; (2) rotary `cached_freqs` buffers are mutated on first call ("duplicated inputs that are mutated"): one eager chunk first fills the cache; (3) autocast casts are not captured for sdpa (dtype assert): sdpa is made explicit fp16 (identical to autocast's policy); (4) AOTI compile needs a CUDA toolkit (`CUDA_HOME`: cuda_runtime.h, crt/, nv/target, libcudart.so); the box has none, test used a shim dir of the venv's triton include tree + `nvidia-cuda-cccl-cu12` headers (downloaded to /tmp, venv untouched) + libcudart symlink.
+
+Marvin Gaye, empty cache dir then reuse: build 178 s (first run, incl. inductor compile), reuse: model_load 3.7 s + warm-up 7.7 s (eager chunk for shape/rotary cache plus one silent chunk each) = ~11.4 s. Cache 1.6 GB .pt2 (fp32 constants inside) + 1.6 GB inductor. Four tracks, one process (`aot-4`, diff vs `keep-eager`):
+
+| | eager+overlap | compile default | aot |
+|---|---|---|---|
+| vocal_pass mean | 23.45 s | 13.62 s | 12.94 s |
+| sw_pass mean | 31.59 s | 17.81 s | 16.70 s |
+| warm-up (warm cache) | 0 | 72.2 s | 7.7 s |
+| worst stem diff | | -53.5 dB | -53.6 dB |
+| peak VRAM (nvidia-smi) | 4.97 GB | 4.79 GB | 5.89 GB |
+
+Per-stem diff is the same as compile to 0.1-1 dB (aot: Marvin bass -53.6, other -54.8; Artful other -53.8; others -59.7 to -75.1). Meets the bars (startup < 15 s, passes within 10% of compile, worst < -50 dB). Cost: needs a CUDA toolkit for the one-off build, 1.6 GB cache, +1.1 GB VRAM. Recommendation: default for repeat use once a toolkit is installed (pacman `cuda`, untested here); keep `--compile` as the no-toolkit path.
+
 Recommendation: keep opt-in. Steady-state speedup is 1.75x, but warm-up is 225 s cold / 72 s warm (limit ~60 s) and the worst stem difference is -53.5 dB.

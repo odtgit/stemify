@@ -11,6 +11,7 @@ while [ $# -gt 0 ]; do
         --fence) fence=1 ;;
         --fp32) extra+=(--fp32) ;;
         --compile) extra+=(--compile) ;;
+        --aot) extra+=(--aot) ;;
         --compile-mode) extra+=(--compile --compile-mode "$2"); shift ;;
         --keep-stems) extra+=(--keep-stems) ;;
         -o) out=$2; shift ;;
