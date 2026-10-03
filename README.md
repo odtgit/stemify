@@ -194,7 +194,7 @@ the compiled paths). Details in [docs/profile-baseline.md](docs/profile-baseline
 ```bash
 git clone https://github.com/odtgit/stemify && cd stemify
 uv venv -p 3.12 .venv
-uv pip install --python .venv/bin/python -r requirements.txt
+uv pip install --python .venv/bin/python --index-strategy unsafe-best-match -r requirements.txt
 ```
 
 `requirements.txt` includes three `nvidia-cuda-*-cu12` wheels pinned to the CUDA
