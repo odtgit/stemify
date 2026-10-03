@@ -71,3 +71,16 @@ Hashes differ, as expected. Caveat: the SW model's attention is flash-only on th
 ## Notes
 - Fence cost here is near zero because the box was idle; cost under CPU load is not tested.
 - Fenced residual uses 2.7 cores vs 17.6 unfenced (OMP cap), but the stage is 0.17 s.
+
+## Mux overlap (2026-10-03)
+write_wavs + mux + finalize run in one background worker while the next track is separated; at most one track is pending (bounded memory), scratch is per track. Same four tracks, one process, `overlap-1`.
+
+| | baseline (unfenced-2) | overlap |
+|---|---|---|
+| batch wall | 259.8 s (sum of track walls) | 234.3 s (-9.8%) |
+| vocal_pass mean | 23.53 s | 23.45 s |
+| sw_pass mean | 31.47 s | 31.59 s |
+| per-track mux wall | 8.87 s | 8.86 s |
+| stem sha256 | | identical for all 4 tracks x 4 stems |
+
+ffmpeg's ~2.7 cores do not slow the GPU passes (within run-to-run spread). Saving is the first three tracks' post stages (~25 s); the last track's ~11 s post stage is not hidden. Per-track `secs` still spans separation to finalize; post-stage walls are measured in the worker without a CUDA sync (cpu is null, not attributable). `track_start` N+1 precedes `track_done` N. Failure path (bogus input mid-batch): `track_failed` in order, batch continues, exit 1, no partial output.

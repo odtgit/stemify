@@ -118,7 +118,7 @@ RTX 3060 12 GB, fp16 autocast, both models resident:
 
 | | |
 |---|---|
-| Speed | 3.2-3.7x realtime (a 4-minute track in ~75 s) |
+| Speed | 3.6-3.9x realtime in a batch (4 tracks, 13 min of audio: 234 s) |
 | VRAM | ~2.4 GB allocated, ~3.1 GB reserved |
 | Model load | ~10 s, once per invocation |
 | Output size | ~40 MB per 4-minute track at 256 kbps (five streams) |
@@ -220,6 +220,9 @@ stemify is designed to be run as a worker process by a host application:
   input path is reported on stderr and skipped without affecting the exit code.
 - **Idempotent**: queued tracks that already have an output are skipped.
 - **Batch**: pass many tracks to one invocation; the model load is paid once.
+- **Overlap**: the next track is separated while the previous one is muxed
+  and finalised (one background worker, one track pending). `track_start` for
+  track N+1 can therefore precede `track_done` for N; both stay in track order.
 - **`--json`**: one JSON object per stdout line; human-readable output is
   suppressed.
 
@@ -257,7 +260,8 @@ NVIDIA cards; avoid rendering during a live set.
 Renders into a scratch dir with `--json --profile --force` while sampling the
 GPU every 100 ms, then prints per-stage wall time, GPU utilisation, CPU cores
 and a wall-vs-minutes fit (`profile_summary.py`). `--fence` runs under the same
-systemd limits as the background batch example above. Pass several run dirs to `profile_summary.py` to
+systemd limits as the background batch example above. `done` carries
+`batch_wall` under `--profile`. Pass several run dirs to `profile_summary.py` to
 compare stem hashes between runs. Baseline: [docs/profile-baseline.md](docs/profile-baseline.md).
 
 ## Output format

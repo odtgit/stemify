@@ -67,7 +67,8 @@ def summarise(d):
     if not tracks:
         return None
     tot = np.array([[t["profile"][k]["wall"] for k in STAGES] for t in tracks])
-    cpu = np.array([[t["profile"][k]["cpu"] for k in STAGES] for t in tracks])
+    cpu = np.array([[t["profile"][k]["cpu"] if t["profile"][k]["cpu"] is not None
+                     else np.nan for k in STAGES] for t in tracks], float)
     gu = np.array([[gpu_mean(g, t["profile"][k]["t0"], t["profile"][k]["t1"])
                     for k in STAGES] for t in tracks])
     mins = np.array([t["audio_secs"] for t in tracks]) / 60
@@ -80,11 +81,15 @@ def summarise(d):
             b, a = np.polyfit(mins, tot[:, i], 1)
             fit = f"a={a:6.2f}  b={b:6.2f}"
         print(f"{k:11s} {tot[:, i].mean():7.2f} {100 * (tot[:, i] / track_wall).mean():7.1f} "
-              f"{np.nanmean(gu[:, i]):6.0f} {(cpu[:, i].sum() / tot[:, i].sum()):6.2f}   {fit}")
+              f"{np.nanmean(gu[:, i]):6.0f} {(np.nansum(cpu[:, i]) / tot[:, i].sum()):6.2f}   {fit}")
     io = tot[:, STAGES.index("write_wavs"):].sum(1)
     print(f"write_wavs+mux+finalize: {100 * (io / track_wall).mean():.1f}% of wall; "
           f"track total mean {track_wall.mean():.1f}s, "
           f"realtime x{(mins * 60 / track_wall).mean():.2f}")
+    done = next((e for e in ev if e["event"] == "done"), {})
+    if "batch_wall" in done:
+        print(f"batch_wall {done['batch_wall']:.1f}s vs sum of track walls "
+              f"{track_wall.sum():.1f}s (post stages overlap next track's passes: cpu n/a)")
     return {Path(t["src"]).name: t["profile"]["stems"] for t in tracks}
 
 
