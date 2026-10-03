@@ -138,3 +138,19 @@ Recommendation: keep opt-in. Steady-state speedup is 1.75x, but warm-up is 225 s
 Default backend is now AOT (package exists: load; else toolkit available: build; else eager with a stderr notice; `--aot` forces, `--eager`/`--fp32` bypass). The build toolkit is three version-matched wheels instead of a system CUDA: `nvidia-cuda-runtime-cu12==12.8.90` (headers, libcudart.so.12; already a torch dependency), `nvidia-cuda-nvcc-cu12==12.8.93` (crt/ headers), `nvidia-cuda-cccl-cu12==12.8.90` (cuda/, cub/, nv/). stemify symlinks their include dirs plus `lib64/libcudart.so` into `${XDG_CACHE_HOME:-~/.cache}/stemify/cudahome` and sets `CUDA_HOME` to it when unset; no compiler from the wheels is used (the host g++ builds the package).
 
 Empty cache, CUDA_HOME unset, Marvin Gaye: build warm-up 178.0 s (startup 1.0 + model_load 5.8 s, then 25.8 s track); reuse: startup 1.1 + model_load 4.2 + warm-up 6.1 = 11.4 s. Four tracks, one process (`default-4`): vocal_pass mean 13.10 s, sw_pass mean 16.80 s, batch wall 135.8 s (5.6x realtime). Per-stem diff vs `aot-4`: worst -55.5 dB (others -61 to -76); vs `keep-eager`: worst -53.3 dB (Marvin bass), others -54.5 to -75.8. Cache: 1.6 GB aot packages, 1.6 GB inductor intermediates (deletable after build), cudahome symlinks only.
+
+## Memory (2026-10-03)
+Four tracks, one process, default AOT backend. cgroup peak from `systemd-run --user --wait -p MemoryAccounting=yes` (includes page cache), /tmp watched every 2 s.
+
+| | before (HEAD) | after |
+|---|---|---|
+| cgroup peak (4 tracks) | 10.2 GB | 4.9 GB |
+| /tmp during run | +1.6 GB (tmpfs, extracted .so x2, mapped by the process) | +0 |
+| process peak VmRSS (VmHWM) | not measured | 7.1 GB (includes file-backed .so pages) |
+| batch wall | 132.4 s | 131.0 s |
+| AOT warm-up (model_load + warm-up per process) | 4.5 + 6.5 s | 3.6 + 4.5 s |
+| stem sha256 vs `default-4` | | identical, 4 tracks x 4 stems |
+
+Mechanism: `aoti_load_package` extracts the package into a hardcoded `/tmp/XXXXXX` (`TMPDIR` is ignored, checked with a run) and maps the 0.7-0.9 GB `.wrapper.so` from there. stemify now extracts each `.pt2` once to `aot/<package>.x/` and builds `AOTIModelContainerRunnerCuda` on that `.so` (same object `aoti_load_package` wraps), so the library is mapped from disk and the extraction is reused.
+Array lifetime: `mix` freed once `inst` exists, MSST's outputs copied out only for the stems used (SW vocals dropped), residual in place, energy and other-extra in float64 chunks, each stem freed once its wav is written, main thread drops the hand-off tuple.
+`--profile` samples VmRSS every 50 ms: per-stage `rss_peak_mb` / `rss_end_mb` and the process `rss_peak_mb` in the `done` event, printed by `profile_summary.py`. Per-track peak is in sw_pass (MSST's own result and counter buffers, 6 stems x 2 ch float32 each): 5.2, 6.0, 6.1, 7.1 GB for 2.5 to 5.4 min tracks.

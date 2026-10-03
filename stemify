@@ -80,6 +80,21 @@ class Prof:
         self.rs, self.torch = resource, torch
         self.stages = {}
         self.stems = {}
+        self.wins = {}
+        self.lock = threading.Lock()
+        self.peak = rss_mb()
+        threading.Thread(target=self._sample, daemon=True).start()
+
+    def _sample(self):
+        while True:
+            self.note(rss_mb())
+            time.sleep(0.05)
+
+    def note(self, r):
+        with self.lock:
+            self.peak = max(self.peak, r)
+            for w in self.wins.values():
+                w[0] = max(w[0], r)
 
     def sync(self):
         if self.torch.cuda.is_available():
@@ -94,21 +109,28 @@ class Prof:
     @contextlib.contextmanager
     def stage(self, name, into=None, sync=True):
         a = self.mark(sync)
+        win = [rss_mb()]
+        with self.lock:
+            self.wins[id(win)] = win
         try:
             yield
         finally:
+            self.note(rss_mb())
+            with self.lock:
+                del self.wins[id(win)]
             b = self.mark(sync)
             ra, rb = a[2], b[2]
             child = (rb.ru_utime + rb.ru_stime) - (ra.ru_utime + ra.ru_stime)
             (self.stages if into is None else into)[name] = {
                 "wall": round(b[0] - a[0], 4),
                 "cpu": round(b[1] - a[1] + child, 4) if sync else None,
-                "t0": round(a[3], 3), "t1": round(b[3], 3)}
+                "t0": round(a[3], 3), "t1": round(b[3], 3),
+                "rss_peak_mb": round(win[0]), "rss_end_mb": round(rss_mb())}
 
     def hash_stems(self, arrs):
         for (label, _, _), a in zip(STEMS, arrs):
             a = np.ascontiguousarray(a, np.float32)
-            rms = math.sqrt(float(np.mean(a.astype(np.float64) ** 2)))
+            rms = math.sqrt(energy(a) / a.size)
             self.stems[label.lower()] = {
                 "sha256": hashlib.sha256(a.tobytes()).hexdigest(),
                 "rms_db": round(20 * math.log10(max(rms, 1e-12)), 3)}
@@ -118,6 +140,14 @@ class Prof:
 
     def line(self):
         return " ".join(f"{k} {v['wall']:.1f}" for k, v in self.stages.items())
+
+
+def rss_mb(key="VmRSS"):
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith(key + ":"):
+                return int(line.split()[1]) / 1024
+    return 0.0
 
 
 AOT_REV = 1  # bump when aot_attach's graph split changes
@@ -189,6 +219,51 @@ def toolkit():
 def notice(msg):
     """Backend-selection notices: always stderr, so --json stdout stays pure events."""
     print(f"stemify: {msg}", file=sys.stderr, flush=True)
+
+
+class Aoti:
+    """Callable over an AOTIModelContainerRunnerCuda (what AOTICompiledModel wraps)."""
+
+    def __init__(self, runner):
+        import torch
+        import torch.utils._pytree as pytree
+        self.runner, self.torch, self.pt = runner, torch, pytree
+        cs = runner.get_call_spec()
+        self.in_spec, self.out_spec = pytree.treespec_loads(cs[0]), pytree.treespec_loads(cs[1])
+
+    def __call__(self, *args):
+        flat = [x for x in self.pt.tree_flatten((args, {}))[0] if isinstance(x, self.torch.Tensor)]
+        return self.pt.tree_unflatten(self.runner.run(flat), self.out_spec)
+
+
+def aot_load(pkg):
+    """Load a .pt2 AOTInductor package from an extraction kept next to it.
+    torch's aoti_load_package unpacks the zip (~0.7-0.9 GB of .so per model) into a
+    hardcoded /tmp/XXXXXX on every call (TMPDIR is ignored), which is RAM on tmpfs.
+    Instead extract once into <pkg>.x/ in the cache (reused by later runs, the
+    old ones are removed when a package is rebuilt) and build the runner on the
+    extracted .so; the .so is then mmapped from disk, not RAM. Falls back to
+    aoti_load_package if that fails."""
+    import torch
+    import zipfile
+    pkg = Path(pkg)
+    x = pkg.with_name(pkg.stem + ".x")
+    try:
+        if not (x / ".ok").exists():
+            tmp = pkg.with_name(pkg.stem + f".x.tmp{os.getpid()}")
+            shutil.rmtree(tmp, ignore_errors=True)
+            with zipfile.ZipFile(pkg) as z:
+                z.extractall(tmp)
+            (tmp / ".ok").touch()
+            shutil.rmtree(x, ignore_errors=True)
+            tmp.rename(x)
+        mdir = next(x.glob("*/data/aotinductor/model"))
+        so = next(mdir.glob("*.wrapper.so"))
+        return Aoti(torch._C._aoti.AOTIModelContainerRunnerCuda(
+            str(so), 1, "cuda", str(mdir)))
+    except Exception as e:
+        notice(f"{pkg.name}: direct load failed ({type(e).__name__}: {e}), using aoti_load_package (extracts to /tmp)")
+        return torch._inductor.aoti_load_package(str(pkg))
 
 
 def aot_attach(m, ckpt, say, force=False):
@@ -292,12 +367,14 @@ def aot_attach(m, ckpt, say, force=False):
         for old in d.glob(f"{ckpt.stem}-*.pt2"):
             if old != pkg:
                 old.unlink()
+        for old in d.glob(f"{ckpt.stem}-*.x*"):
+            shutil.rmtree(old, ignore_errors=True)
     n = len(net.mask_estimators)
     net.band_split, net.layers = None, nn.ModuleList()
     if hasattr(net, "final_norm"):
         net.final_norm = nn.Identity()
     net.mask_estimators = nn.ModuleList([Idx(i) for i in range(n)])
-    net.band_split = Run(torch._inductor.aoti_load_package(str(pkg)))
+    net.band_split = Run(aot_load(pkg))
     del core
     torch.cuda.empty_cache()
     return how
@@ -320,17 +397,30 @@ def decode(src):
     return np.frombuffer(raw, np.float32).reshape(-1, 2)
 
 
-def energy(x):
-    return float(np.dot(x.ravel().astype(np.float64), x.ravel().astype(np.float64)))
+def energy(x, step=1 << 21):
+    """Sum of squares in float64, converted chunk by chunk (no full-size copy)."""
+    x = x.ravel()
+    t = 0.0
+    for i in range(0, len(x), step):
+        c = x[i:i + step].astype(np.float64)
+        t += float(np.dot(c, c))
+    return t
 
 
-def sep(model, x):
+def sep(model, x, keep=None):
     """x: (n, 2) float -> {stem: (n, 2) float32}. MSST chunks with the YAML
-    chunk_size/num_overlap and runs in float, no peak normalisation."""
+    chunk_size/num_overlap and runs in float, no peak normalisation. Only the
+    stems in keep (default all) are copied out; MSST's own outputs are freed."""
     with contextlib.redirect_stdout(sys.stderr):
         out = model.separate(np.ascontiguousarray(x.T))
     n = len(x)
-    return {k: np.ascontiguousarray(v.T[:n]) for k, v in out.items()}
+    res = {}
+    for k in list(out):
+        v = out.pop(k)
+        if keep is None or k in keep:
+            res[k] = np.ascontiguousarray(v.T[:n])
+        del v
+    return res
 
 
 def separate_ft2sw(models, src, prof=None):
@@ -339,23 +429,34 @@ def separate_ft2sw(models, src, prof=None):
     S = prof.stage if prof else (lambda n: contextlib.nullcontext())
     with S("decode"):
         mix = decode(src)
+    nframes = len(mix)
     with S("vocal_pass"):
-        v = sep(m_v, mix)["vocals"]
+        v = sep(m_v, mix, {"vocals"})["vocals"]
     with S("inst"):
         inst = mix - v
+        del mix
     with S("sw_pass"):
-        st = sep(m_sw, inst)
+        st = sep(m_sw, inst, {"drums", "bass", "other", "guitar", "piano"})
     with S("residual"):
-        d, b = st["drums"], st["bass"]
-        o = inst - d - b
+        d, b = st.pop("drums"), st.pop("bass")
+        o = inst - d
+        o -= b
+        del inst
         # Energy in O that SW itself did not call other/guitar/piano.
         eo = energy(o)
-        extra = energy(o - (st["other"] + st["guitar"] + st["piano"]))
+        sw_o = st.pop("other")
+        sw_o += st.pop("guitar")
+        sw_o += st.pop("piano")
+        del st
+        extra = 0.0
+        for i in range(0, len(o), 1 << 20):
+            extra += energy(o[i:i + (1 << 20)] - sw_o[i:i + (1 << 20)])
+        del sw_o
         extra_db = (10 * math.log10(max(extra, 1e-30) / eo)
                     if eo > 0 else float("nan"))
     if prof:
         prof.hash_stems([d, b, o, v])
-    return [d, b, o, v], len(mix), extra_db
+    return [d, b, o, v], nframes, extra_db
 
 
 def mux(src, stems, dest, rate, bitrate):
@@ -689,6 +790,8 @@ def main():
                     p = wd / f"{label.lower()}.wav"
                     sf.write(str(p), a, RATE, subtype="FLOAT")
                     stems.append(p)
+                    del a
+                    arrs[len(stems) - 1] = None  # free each stem once written
             with P("mux"):
                 mux(src, stems, dest, probe_rate(src), args.bitrate)
             with P("finalize"):
@@ -748,6 +851,7 @@ def main():
             prof.stages, prof.stems = {}, {}
         try:
             arrs, nframes, extra_db = separate_ft2sw(models, src, prof)
+            arrs = list(arrs)
         except Exception as e:
             drain()  # keep events in track order
             failures += 1
@@ -763,6 +867,7 @@ def main():
             pending = ex.submit(post, *job)
         else:
             failures += not post(*job)
+        del job
     drain()
     if ex:
         ex.shutdown()
@@ -771,7 +876,8 @@ def main():
     shutil.rmtree(work, ignore_errors=True)
     say(f"\ndone: {len(todo) - failures}/{len(todo)} succeeded")
     event(event="done", ok=len(todo) - failures, failed=failures,
-          **({"batch_wall": round(batch_wall, 2)} if prof else {}))
+          **({"batch_wall": round(batch_wall, 2), "rss_peak_mb": round(rss_mb("VmHWM"))}
+             if prof else {}))
     return 1 if failures else 0
 
 

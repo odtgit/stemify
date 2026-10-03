@@ -86,7 +86,16 @@ def summarise(d):
     print(f"write_wavs+mux+finalize: {100 * (io / track_wall).mean():.1f}% of wall; "
           f"track total mean {track_wall.mean():.1f}s, "
           f"realtime x{(mins * 60 / track_wall).mean():.2f}")
+    rp = np.array([[t["profile"][k].get("rss_peak_mb", np.nan) for k in STAGES] for t in tracks], float)
+    if not np.isnan(rp).all():
+        print("\nRSS peak MB per stage window (main-thread stages; post stages run concurrently "
+              "with the next track):")
+        print(f"{'track':40s} " + " ".join(f"{k[:9]:>9s}" for k in STAGES))
+        for t, row in zip(tracks, rp):
+            print(f"{Path(t['src']).name[:40]:40s} " + " ".join(f"{x:9.0f}" for x in row))
     done = next((e for e in ev if e["event"] == "done"), {})
+    if "rss_peak_mb" in done:
+        print(f"process peak RSS (VmHWM): {done['rss_peak_mb']} MB")
     if "batch_wall" in done:
         print(f"batch_wall {done['batch_wall']:.1f}s vs sum of track walls "
               f"{track_wall.sum():.1f}s (post stages overlap next track's passes: cpu n/a)")

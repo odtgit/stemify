@@ -219,7 +219,11 @@ both models, 178 s measured, once), every later run just loads it
 `--aot` forces AOT and errors instead of falling back, `--eager` forces plain
 eager, `--compile` uses `torch.compile` (long warm-up, rarely worth it for
 single tracks). `--fp32` implies eager. Cache under
-`${XDG_CACHE_HOME:-~/.cache}/stemify/`: `aot/` (~1.6 GB), `inductor/` and
+`${XDG_CACHE_HOME:-~/.cache}/stemify/`: `aot/` (~3.2 GB: the two `.pt2` packages,
+1.6 GB, plus `<package>.x/`, their one-off extraction, 1.6 GB, which is what gets
+loaded; torch's own `aoti_load_package` would unpack 1.6 GB into `/tmp` on every run,
+RAM on a tmpfs `/tmp`, so stemify never calls it; `.x/` is rebuilt from the `.pt2`
+if missing and removed when a package is rebuilt), `inductor/` and
 `triton/` (~1.6 GB, build intermediates, safe to delete after the build),
 `cudahome/` (a few hundred symlinks into the venv, rebuilt automatically).
 Set `CUDA_HOME` yourself to use another toolkit; it must match torch's CUDA.
