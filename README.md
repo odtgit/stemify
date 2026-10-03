@@ -86,6 +86,42 @@ Vocal separation quality on the
 DJ-app figures are mid-2024 versions submitted by one tester; treat them as
 indicative. Differences under ~0.3 dB are rarely audible.
 
+## Architecture
+
+```mermaid
+flowchart TB
+  CLI["CLI / shell"] --> SEL
+  HOST["Host app or batch runner<br/>--json events · exit code"] --> SEL
+
+  subgraph P["stemify process (models load once per batch)"]
+    SEL{"backend<br/>AOT · compile · eager"}
+    SEP["separate (GPU)<br/>FT2 vocals → SW on instrumental<br/>other = residual"]
+    POST["post worker thread<br/>mux AAC · cover · stem manifest · verify"]
+    SEL --> SEP -- "track N" --> POST
+    SEP -. "track N+1 starts while N muxes" .-> SEP
+  end
+
+  subgraph V["venv runtime"]
+    MSST["msst model code"] --> TORCH["PyTorch + CUDA wheels"]
+  end
+  MODELS[("models/<br/>checkpoints + YAML")] --> MSST
+  SEP --> MSST
+
+  CACHE[("~/.cache/stemify<br/>aot/ · inductor/ · cudahome/")]
+  SEL <--> CACHE
+
+  POST --> OUT[("track.stem.mp4")] --> MIXXX["Mixxx 2.6+"]
+```
+
+- **Backend select** picks AOT when packages exist or can be built, otherwise
+  eager; `--compile` and `--eager` override. See [Backend](#backend-aot-by-default).
+- **One process, many tracks**: models load once; each track's mux/tagging runs
+  on a worker thread while the GPU separates the next track (at most one track
+  queued, so memory stays bounded).
+- **Self-contained runtime**: PyTorch and the CUDA headers for AOT builds come
+  from pip wheels in the venv; the system only needs the NVIDIA driver and
+  ffmpeg.
+
 ## Pipeline
 
 ```
