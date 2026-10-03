@@ -127,11 +127,77 @@ def cache_root():
     return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "stemify"
 
 
-def aot_attach(m, ckpt, say):
+CUDA_WHEELS = (  # (nvidia/ subdir, pip name): build-time toolkit for the AOT build
+    ("cuda_runtime", "nvidia-cuda-runtime-cu12"),  # cuda_runtime.h etc, libcudart.so.12
+    ("cuda_nvcc", "nvidia-cuda-nvcc-cu12"),        # crt/ headers
+    ("cuda_cccl", "nvidia-cuda-cccl-cu12"))        # cuda/, cub/, nv/ headers
+CUDA_INSTALL_HINT = ("uv pip install nvidia-cuda-nvcc-cu12==12.8.93 "
+                     "nvidia-cuda-cccl-cu12==12.8.90 nvidia-cuda-runtime-cu12==12.8.90")
+
+
+def wheel_cuda_home():
+    """Assemble (or reuse) a CUDA_HOME of symlinks into the venv's nvidia wheels
+    under cache_root()/cudahome. Returns the path, or None if a wheel is missing
+    (STEMIFY_NO_CUDA_WHEELS=1 simulates that)."""
+    from importlib import metadata
+    if os.environ.get("STEMIFY_NO_CUDA_WHEELS"):
+        return None
+    try:
+        import nvidia
+        roots = [Path(p) for p in nvidia.__path__]
+        srcs = []
+        for sub, pipname in CUDA_WHEELS:
+            d = next((r / sub for r in roots if (r / sub / "include").is_dir()), None)
+            if d is None:
+                return None
+            srcs.append((d, metadata.version(pipname)))
+    except (ImportError, metadata.PackageNotFoundError):
+        return None
+    if not (srcs[0][0] / "lib" / "libcudart.so.12").exists():
+        return None
+    home = cache_root() / "cudahome"
+    stamp = "\n".join(f"{d} {v}" for d, v in srcs)
+    ok = home / ".stamp"
+    if ok.exists() and ok.read_text() == stamp and not any(
+            not l.exists() for l in home.rglob("*") if l.is_symlink()):
+        return str(home)
+    shutil.rmtree(home, ignore_errors=True)
+    (home / "include").mkdir(parents=True)
+    (home / "lib64").mkdir()
+    for d, _ in srcs:  # first wheel wins on a name clash
+        for e in sorted((d / "include").iterdir()):
+            if e.name != "__init__.py" and not (home / "include" / e.name).exists():
+                (home / "include" / e.name).symlink_to(e)
+    (home / "lib64" / "libcudart.so").symlink_to(srcs[0][0] / "lib" / "libcudart.so.12")
+    (home / "lib").symlink_to("lib64")
+    ok.write_text(stamp)
+    return str(home)
+
+
+def toolkit():
+    """CUDA_HOME for the AOT build: the user's, else the wheel-assembled one
+    (exported to the env and torch.utils.cpp_extension). None if neither."""
+    home = os.environ.get("CUDA_HOME")
+    if not home:
+        home = wheel_cuda_home()
+        if home:
+            import torch.utils.cpp_extension as ce
+            os.environ["CUDA_HOME"] = ce.CUDA_HOME = home
+    return home or None
+
+
+def notice(msg):
+    """Backend-selection notices: always stderr, so --json stdout stays pure events."""
+    print(f"stemify: {msg}", file=sys.stderr, flush=True)
+
+
+def aot_attach(m, ckpt, say, force=False):
     """Swap the heavy middle of m's forward (band split, transformers, mask heads)
     for an AOTInductor package; STFT, complex mask apply and iSTFT stay eager.
     Package is built on first use into cache_root()/aot, keyed by torch, GPU,
-    checkpoint size+mtime and chunk shape. Returns "build" or "load"."""
+    checkpoint size+mtime and chunk shape. Returns "build" or "load"; with
+    force=False returns None (model untouched) if there is no package and no
+    toolkit or the build fails; force=True exits/raises instead."""
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -191,33 +257,46 @@ def aot_attach(m, ckpt, say):
     h = net.band_split.register_forward_pre_hook(lambda mod, a: shape.append(tuple(a[0].shape)))
     sep(m, np.zeros((m._config.audio.chunk_size, 2), np.float32))  # eager: fills rotary caches
     h.remove()
-    st = Path(ckpt).stat()
+    ckpt = Path(ckpt)
+    st = ckpt.stat()
     key = hashlib.sha1("|".join(map(str, (
         AOT_REV, torch.__version__, torch.cuda.get_device_name(), st.st_size, st.st_mtime_ns,
         shape[0]))).encode()).hexdigest()[:16]
     d = cache_root() / "aot"
-    pkg = d / f"{Path(ckpt).stem}-{key}.pt2"
+    pkg = d / f"{ckpt.stem}-{key}.pt2"
     core = Core(net)
+    how = "load"
+    if not pkg.exists():
+        how = "build"
+        if not toolkit():
+            msg = ("first AOT build needs a CUDA toolkit: install the version-matched wheels "
+                   f"({CUDA_INSTALL_HINT}) or set CUDA_HOME")
+            if force:
+                sys.exit(f"--aot: {msg}")
+            notice(f"{ckpt.name}: running eager, {msg}")
+            return None
+        say(f"aot: building {pkg.name} (one-off) ...")
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = pkg.with_suffix(".tmp.pt2")
+        try:
+            with torch.autocast("cuda"), torch.inference_mode():
+                ep = torch.export.export(core, (torch.zeros(shape[0], device="cuda"),),
+                                         strict=False)
+                torch._inductor.aoti_compile_and_package(ep, package_path=str(tmp))
+        except Exception as e:
+            if force:
+                raise
+            notice(f"{ckpt.name}: AOT build failed ({type(e).__name__}), running eager")
+            return None
+        tmp.rename(pkg)
+        for old in d.glob(f"{ckpt.stem}-*.pt2"):
+            if old != pkg:
+                old.unlink()
     n = len(net.mask_estimators)
     net.band_split, net.layers = None, nn.ModuleList()
     if hasattr(net, "final_norm"):
         net.final_norm = nn.Identity()
     net.mask_estimators = nn.ModuleList([Idx(i) for i in range(n)])
-    how = "load"
-    if not pkg.exists():
-        how = "build"
-        if not os.environ.get("CUDA_HOME"):
-            sys.exit("--aot: first build needs CUDA_HOME pointing at a CUDA toolkit "
-                     "(headers + lib64/libcudart.so), e.g. CUDA_HOME=/opt/cuda; see README")
-        say(f"aot: building {pkg.name} (one-off, needs CUDA_HOME with CUDA headers) ...")
-        d.mkdir(parents=True, exist_ok=True)
-        for old in d.glob(f"{Path(ckpt).stem}-*.pt2"):
-            old.unlink()
-        with torch.autocast("cuda"), torch.inference_mode():
-            ep = torch.export.export(core, (torch.zeros(shape[0], device="cuda"),), strict=False)
-            tmp = pkg.with_suffix(".tmp.pt2")
-            torch._inductor.aoti_compile_and_package(ep, package_path=str(tmp))
-        tmp.rename(pkg)
     net.band_split = Run(torch._inductor.aoti_load_package(str(pkg)))
     del core
     torch.cuda.empty_cache()
@@ -463,20 +542,29 @@ def main():
     ap.add_argument("--profile", action="store_true",
                     help="per-stage wall/CPU timing, stem hashes and RMS (see README)")
     ap.add_argument("--fp32", action="store_true",
-                    help="disable autocast (fp16) in both models, for comparison")
+                    help="disable autocast (fp16) in both models, for comparison; implies "
+                         "--eager unless --compile is given")
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile both models. Pays a warm-up once per "
                          "invocation; stems differ slightly from the eager path")
     ap.add_argument("--aot", action="store_true",
-                    help="AOTInductor package of each model's transformer core, built once "
-                         "into the cache dir (see README); faster than eager, near-zero warm-up")
+                    help="force the AOTInductor backend (the default when possible): error "
+                         "instead of falling back if the package cannot be built or loaded")
+    ap.add_argument("--eager", action="store_true",
+                    help="plain eager PyTorch, no AOT package, no compile")
     ap.add_argument("--compile-mode", default="default",
                     choices=["default", "reduce-overhead", "max-autotune"])
     ap.add_argument("--json", action="store_true",
                     help="one JSON event per stdout line instead of human lines")
     args = ap.parse_args()
-    if args.aot and (args.compile or args.fp32):
-        ap.error("--aot excludes --compile and --fp32")
+    if sum((args.aot, args.compile, args.eager)) > 1:
+        ap.error("--aot, --compile and --eager are mutually exclusive")
+    if args.aot and args.fp32:
+        ap.error("--aot excludes --fp32")
+    if args.fp32 and not args.compile:
+        args.eager = True
+    # default: AOT if a package exists or can be built, else eager (with a notice on stderr)
+    use_aot = args.aot or not (args.compile or args.eager)
 
     if args.model != DEFAULT_MODEL:
         ap.error(f"only -m {DEFAULT_MODEL} is supported (legacy htdemucs_ft path dropped)")
@@ -513,7 +601,7 @@ def main():
 
     os.environ.setdefault("TQDM_DISABLE", "1")
 
-    if args.compile or args.aot:  # persistent compile caches; must precede torch import
+    if args.compile or use_aot:  # persistent compile caches; must precede torch import
         cache = cache_root()
         os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(cache / "inductor"))
         os.environ.setdefault("TRITON_CACHE_DIR", str(cache / "triton"))
@@ -553,11 +641,12 @@ def main():
                 if cfg is not None:
                     mod.cuda_config = type(cfg)(False, True, True)
     cp = {}
-    if args.aot:
+    if use_aot:
         say("aot ...")
         with (prof.stage("compile", cp) if prof else contextlib.nullcontext()):
             for m, spec in zip(models, (VOCAL_MODEL, SW_MODEL)):
-                say(f"aot: {aot_attach(m, model_dir / spec[2], say)} {spec[2]}")
+                how = aot_attach(m, model_dir / spec[2], say, force=args.aot)
+                say(f"aot: {how or 'eager'} {spec[2]}")
                 sep(m, np.zeros((m._config.audio.chunk_size, 2), np.float32))
     if args.compile:
         say(f"compiling ({args.compile_mode}) ...")

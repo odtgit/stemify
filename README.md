@@ -121,7 +121,7 @@ RTX 3060 12 GB, fp16 autocast, both models resident:
 | Speed | 3.6-3.9x realtime in a batch (4 tracks, 13 min of audio: 234 s) |
 | VRAM | ~2.4 GB allocated, ~3.1 GB reserved |
 | Model load | ~4.5 s, once per invocation |
-| With `--compile` | 5.6x realtime steady state, batch of 4 in 140 s plus warm-up |
+| With `--compile` / default AOT | 5.6x realtime steady state, batch of 4 in 140 s plus warm-up (`--compile`: 72-225 s; AOT: ~8 s once built) |
 | Output size | ~40 MB per 4-minute track at 256 kbps (five streams) |
 
 ## Requirements
@@ -140,6 +140,33 @@ git clone https://github.com/odtgit/stemify && cd stemify
 uv venv -p 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 ```
+
+`requirements.txt` includes three `nvidia-cuda-*-cu12` wheels pinned to the CUDA
+12.8 build torch ships with. They are only the build-time toolkit for the default
+AOT backend (below); no system CUDA toolkit is needed or wanted (a newer one
+would mismatch torch's CUDA).
+
+### Backend: AOT by default
+
+With no flag, stemify uses an AOTInductor package of each model's transformer
+core. The first run on a given torch/GPU/checkpoint builds it (about 3 min for
+both models, 178 s measured, once), every later run just loads it
+(~11 s startup against eager's ~4.5 s, passes ~1.8x faster than eager). Selection:
+
+1. a matching package exists in the cache: use it
+2. else, if a CUDA toolkit is available (`CUDA_HOME`, or assembled automatically
+   from the venv's `nvidia-cuda-*` wheels): build it, then use it
+3. else run eager and print a one-line notice on **stderr** (also with
+   `--json`, whose stdout stays pure events) saying how to install the wheels.
+   A failed build also falls back to eager with a notice.
+
+`--aot` forces AOT and errors instead of falling back, `--eager` forces plain
+eager, `--compile` uses `torch.compile` (long warm-up, rarely worth it for
+single tracks). `--fp32` implies eager. Cache under
+`${XDG_CACHE_HOME:-~/.cache}/stemify/`: `aot/` (~1.6 GB), `inductor/` and
+`triton/` (~1.6 GB, build intermediates, safe to delete after the build),
+`cudahome/` (a few hundred symlinks into the venv, rebuilt automatically).
+Set `CUDA_HOME` yourself to use another toolkit; it must match torch's CUDA.
 
 ### Models
 
@@ -191,9 +218,10 @@ carried over, and embedded cover art from FLAC and MP3 sources.
 | `--art-only` | off | copy embedded art from the source into existing outputs |
 | `--json` | off | machine-readable progress (below) |
 | `--profile` | off | per-stage timing, stem hashes (adds `profile` to `--json`; see Profiling) |
-| `--fp32` | off | disable autocast, for precision comparison only |
-| `--compile` | off | `torch.compile` both models: ~1.75x faster passes after a one-off warm-up (225 s cold, ~70 s with a warm inductor cache); stems differ from eager by -53 to -75 dB. Pays off from ~10 tracks per invocation (~3 with a warm cache). The inductor/triton caches persist in `${XDG_CACHE_HOME:-~/.cache}/stemify/{inductor,triton}` (~320 MB), so only the first run after a model or torch change is cold; `TORCHINDUCTOR_CACHE_DIR`/`TRITON_CACHE_DIR` override |
-| `--aot` | off | AOTInductor package of each model's transformer core (STFT/iSTFT stay eager), built once into `${XDG_CACHE_HOME:-~/.cache}/stemify/aot` (~1.6 GB; keyed by torch, GPU, checkpoint, chunk shape). Build 178 s and needs `CUDA_HOME` (CUDA toolkit headers + `lib64/libcudart.so`); reuse starts in ~11 s. Passes ~5% faster than `--compile`, worst stem difference vs eager -53.6 dB, VRAM +1.1 GB. Excludes `--compile`/`--fp32` |
+| `--fp32` | off | disable autocast, for precision comparison only; implies `--eager` |
+| `--eager` | off | plain eager PyTorch (no AOT package, no compile) |
+| `--aot` | on if possible | AOTInductor package of each model's transformer core (STFT/iSTFT stay eager), the default backend (see Backend). Flag forces it and errors if the package cannot be built or loaded. Passes ~5% faster than `--compile`, worst stem difference vs eager -53.6 dB, VRAM +1.1 GB |
+| `--compile` | off | `torch.compile` both models: ~1.75x faster passes after a one-off warm-up (225 s cold, ~70 s with a warm inductor cache); stems differ from eager by -53 to -75 dB. Pays off from ~10 tracks per invocation (~3 with a warm cache). The inductor/triton caches persist in `${XDG_CACHE_HOME:-~/.cache}/stemify/{inductor,triton}` (~320 MB for `--compile`), so only the first run after a model or torch change is cold; `TORCHINDUCTOR_CACHE_DIR`/`TRITON_CACHE_DIR` override |
 | `--compile-mode` | `default` | `reduce-overhead` or `max-autotune`; max-autotune warms up for 425 s to gain 6% |
 
 ### In Mixxx
@@ -228,7 +256,7 @@ stemify is designed to be run as a worker process by a host application:
   and finalised (one background worker, one track pending). `track_start` for
   track N+1 can therefore precede `track_done` for N; both stay in track order.
 - **`--json`**: one JSON object per stdout line; human-readable output is
-  suppressed.
+  suppressed. Backend notices (AOT unavailable, eager fallback) go to stderr.
 
 ```json
 {"event": "start", "n": 2}

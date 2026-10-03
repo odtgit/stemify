@@ -47,7 +47,9 @@ networkx==3.7
 numba==0.68.0
 numpy==2.5.3
 nvidia-cublas-cu12==12.8.4.1
+nvidia-cuda-cccl-cu12==12.8.90
 nvidia-cuda-cupti-cu12==12.8.90
+nvidia-cuda-nvcc-cu12==12.8.93
 nvidia-cuda-nvrtc-cu12==12.8.93
 nvidia-cuda-runtime-cu12==12.8.90
 nvidia-cudnn-cu12==9.19.0.56

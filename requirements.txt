@@ -8,3 +8,8 @@ msst[bs-roformer,mel-band-roformer]==0.1.0
 numpy==2.5.3
 soundfile==0.14.0
 mutagen==1.48.1
+# Build-time toolkit for the AOT backend (one-off package build; stemify assembles a
+# CUDA_HOME from these). Version-matched to torch cu128: do not use a system CUDA.
+nvidia-cuda-runtime-cu12==12.8.90
+nvidia-cuda-nvcc-cu12==12.8.93
+nvidia-cuda-cccl-cu12==12.8.90
