@@ -153,9 +153,9 @@ mux: [original mix, D, B, other, V] ─▶ 5 AAC streams + stem manifest + cover
 RTX 3060 12 GB, default backend (AOT), both models resident.
 
 **Real-world run:** re-rendering a 351-track DJ library (house, disco, garage,
-edits; 2-12 min tracks) as one low-priority background batch:
-**7.7x realtime** overall, i.e. an hour of music in under 8 minutes,
-zero failures (figures from the first 81 tracks; updated when the run completes).
+edits; 2-12 min tracks, 27.8 h of audio) as one low-priority background batch
+took 3 h 32 min: **7.9x realtime** including startup, an hour of music in
+under 8 minutes, zero failures.
 
 How we got there, same GPU:
 
@@ -166,7 +166,7 @@ How we got there, same GPU:
 | + MSST backend: in-memory, fp16 | ~11.1 | 3.6x | ~67 s |
 | + mux/tagging overlapped with the next track's separation | ~11.1 | 4.0x | ~60 s |
 | + AOT-compiled transformer core (**default**) | ~11.1 | **6.9x** | ~35 s |
-| Real-world library batch (long tracks amortise per-track costs) | ~11.1 | **7.7x** | |
+| Real-world library batch, 351 tracks (long tracks amortise per-track costs) | ~11.1 | **7.9x** | |
 
 Rows 1-2: real batches (148 and 6 tracks). Rows 3-5: the same 4 tracks
 (15.6 min) in one process, excluding startup. Last row: whole batch including
