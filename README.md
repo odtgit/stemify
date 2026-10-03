@@ -319,6 +319,8 @@ systemd-run --user --collect -p CPUWeight=20 -p Nice=19 -p IOSchedulingClass=idl
 GPU contention with waveform rendering has no equivalent knob on consumer
 NVIDIA cards; avoid rendering during a live set.
 
+Open items for a host-app background queue: [docs/integration-notes.md](docs/integration-notes.md).
+
 ### Profiling
 
 ```bash
