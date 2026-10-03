@@ -404,6 +404,11 @@ def main():
 
     os.environ.setdefault("TQDM_DISABLE", "1")
 
+    if args.compile:  # persistent compile caches; must precede torch import
+        cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "stemify"
+        os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(cache / "inductor"))
+        os.environ.setdefault("TRITON_CACHE_DIR", str(cache / "triton"))
+
     # Import late so --help stays instant; loading torch takes seconds.
     from msst import Separator
     prof = None

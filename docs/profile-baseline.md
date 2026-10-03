@@ -111,4 +111,9 @@ Per-stem difference vs eager float stems, 10log10(E[diff]/E[ref]) dB (default mo
 
 Other-extra unchanged to 0.05 dB (-22.24, -23.21, -21.18, -27.63). Hashes differ, as expected. Worst stem -53.5 dB: below the -50 dB opt-in bar, short of the -60 dB default bar. With compile the post stage (~9 s) is still hidden behind ~31 s of GPU work per track.
 
+### Persistent compile cache
+`--compile` defaults `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` to `${XDG_CACHE_HOME:-~/.cache}/stemify/{inductor,triton}` (unless already set), before torch is imported; previously /tmp (tmpfs, cold after every reboot). `fx_graph_cache` and `enable_autograd_cache` are already True in torch 2.11. One track (Marvin Gaye), empty cache dir then reuse: warm-up 219.0 s cold, 72.0 s warm; cache is 184 MB inductor + 132 MB triton. Runs `cache-cold`, `cache-warm`.
+
+Mega-cache (`torch.compiler.save_cache_artifacts`/`load_cache_artifacts`): saved after a warm run (166 MB, 4 FX graphs plus autotune configs), loaded into an empty cache dir at startup in 0.3 s: warm-up 216.1 s, i.e. no gain over a cold start (the 72 s warm figure needs the on-disk cache entries; the artifact does not reproduce them). Not added.
+
 Recommendation: keep opt-in. Steady-state speedup is 1.75x, but warm-up is 225 s cold / 72 s warm (limit ~60 s) and the worst stem difference is -53.5 dB.
