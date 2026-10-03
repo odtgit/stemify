@@ -84,3 +84,31 @@ write_wavs + mux + finalize run in one background worker while the next track is
 | stem sha256 | | identical for all 4 tracks x 4 stems |
 
 ffmpeg's ~2.7 cores do not slow the GPU passes (within run-to-run spread). Saving is the first three tracks' post stages (~25 s); the last track's ~11 s post stage is not hidden. Per-track `secs` still spans separation to finalize; post-stage walls are measured in the worker without a CUDA sync (cpu is null, not attributable). `track_start` N+1 precedes `track_done` N. Failure path (bogus input mid-batch): `track_failed` in order, batch continues, exit 1, no partial output.
+
+## torch.compile (2026-10-03)
+`--compile` calls `nn.Module.compile()` on the module MSST holds (`Separator._model`; `demix` calls `model(arr)`, so the compiled forward is the one used) and warms it with one silent chunk per model. Chunks are always padded to chunk_size and both inference batch sizes are 1, so shapes are fixed: no recompiles seen. Same four tracks, one process, `compile-1` (default mode), keep-stems eager run `keep-eager` for the diff.
+
+| | eager+overlap | compile default | compile max-autotune |
+|---|---|---|---|
+| warm-up (cold cache) | 0 | 224.9 s | 424.9 s |
+| warm-up (warm inductor cache) | 0 | 72.2 s | n/a |
+| vocal_pass mean | 23.45 s | 13.62 s (1.72x) | 12.81 s (1.83x) |
+| sw_pass mean | 31.59 s | 17.81 s (1.77x) | 16.83 s (1.88x) |
+| batch wall excl. warm-up | 234.3 s | 140.1 s | 132.7 s |
+| batch wall incl. cold warm-up | 234.3 s | 365.0 s | 557.6 s |
+| steady s per track (GPU bound, mux hidden) | 55.0 | 31.4 | 29.6 |
+
+Break-even vs eager: 225 / (55.0 - 31.4) = ~9.5 tracks of this mix (~3.2 min average) cold, ~3 tracks with a warm cache. max-autotune gains 6% over default for 200 s more warm-up.
+
+Per-stem difference vs eager float stems, 10log10(E[diff]/E[ref]) dB (default mode):
+
+| track | drums | bass | other | vocals |
+|---|---|---|---|---|
+| Ain't No Mountain | -61.9 | -53.5 | -54.8 | -75.0 |
+| Give Me the Night | -69.0 | -63.3 | -63.8 | -74.7 |
+| Re-Rewind | -59.9 | -71.5 | -53.8 | -71.3 |
+| Rain | -63.5 | -66.7 | -59.5 | -72.2 |
+
+Other-extra unchanged to 0.05 dB (-22.24, -23.21, -21.18, -27.63). Hashes differ, as expected. Worst stem -53.5 dB: below the -50 dB opt-in bar, short of the -60 dB default bar. With compile the post stage (~9 s) is still hidden behind ~31 s of GPU work per track.
+
+Recommendation: keep opt-in. Steady-state speedup is 1.75x, but warm-up is 225 s cold / 72 s warm (limit ~60 s) and the worst stem difference is -53.5 dB.

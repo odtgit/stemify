@@ -360,6 +360,11 @@ def main():
                     help="per-stage wall/CPU timing, stem hashes and RMS (see README)")
     ap.add_argument("--fp32", action="store_true",
                     help="disable autocast (fp16) in both models, for comparison")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile both models. Pays a warm-up once per "
+                         "invocation; stems differ slightly from the eager path")
+    ap.add_argument("--compile-mode", default="default",
+                    choices=["default", "reduce-overhead", "max-autotune"])
     ap.add_argument("--json", action="store_true",
                     help="one JSON event per stdout line instead of human lines")
     args = ap.parse_args()
@@ -433,9 +438,18 @@ def main():
                 cfg = getattr(mod, "cuda_config", None)
                 if cfg is not None:
                     mod.cuda_config = type(cfg)(False, True, True)
+    cp = {}
+    if args.compile:
+        say(f"compiling ({args.compile_mode}) ...")
+        with (prof.stage("compile", cp) if prof else contextlib.nullcontext()):
+            for m in models:
+                m._model.compile(mode=args.compile_mode)
+                # one silent chunk: same shapes and autocast path as real demix
+                sep(m, np.zeros((m._config.audio.chunk_size, 2), np.float32))
     if prof:
         event(event="profile_process", startup=startup, model_load=ml["model_load"],
-              fp32=args.fp32)
+              fp32=args.fp32, compile=args.compile_mode if args.compile else None,
+              **({"warmup": cp["compile"]} if cp else {}))
         say(f"profile: startup {startup['wall']:.1f}s, model_load "
             f"{ml['model_load']['wall']:.1f}s")
 

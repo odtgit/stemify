@@ -120,7 +120,8 @@ RTX 3060 12 GB, fp16 autocast, both models resident:
 |---|---|
 | Speed | 3.6-3.9x realtime in a batch (4 tracks, 13 min of audio: 234 s) |
 | VRAM | ~2.4 GB allocated, ~3.1 GB reserved |
-| Model load | ~10 s, once per invocation |
+| Model load | ~4.5 s, once per invocation |
+| With `--compile` | 5.6x realtime steady state, batch of 4 in 140 s plus warm-up |
 | Output size | ~40 MB per 4-minute track at 256 kbps (five streams) |
 
 ## Requirements
@@ -191,6 +192,8 @@ carried over, and embedded cover art from FLAC and MP3 sources.
 | `--json` | off | machine-readable progress (below) |
 | `--profile` | off | per-stage timing, stem hashes (adds `profile` to `--json`; see Profiling) |
 | `--fp32` | off | disable autocast, for precision comparison only |
+| `--compile` | off | `torch.compile` both models: ~1.75x faster passes after a one-off warm-up (225 s cold, ~70 s with a warm inductor cache); stems differ from eager by -53 to -75 dB. Pays off from ~10 tracks per invocation (~3 with a warm cache) |
+| `--compile-mode` | `default` | `reduce-overhead` or `max-autotune`; max-autotune warms up for 425 s to gain 6% |
 
 ### In Mixxx
 
